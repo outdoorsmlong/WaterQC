@@ -28,6 +28,44 @@ from water_quality_qc_v2 import (
 )
 
 # ---------------------------------------------------------------------------
+# Robust CSV reading (handles Excel exports: UTF-16, Latin-1, tabs, etc.)
+# ---------------------------------------------------------------------------
+
+def read_csv_resilient(uploaded_file, label: str = "file") -> tuple[pd.DataFrame, str]:
+    """Read a CSV upload trying common encodings and delimiters.
+
+    Excel-exported CSVs are often UTF-16 (with a BOM) or Windows-1252,
+    not UTF-8. Tab-separated exports also happen. This tries each
+    combination and returns the first that parses to >= 2 columns.
+
+    Returns (dataframe, note) where `note` describes which encoding worked.
+    """
+    encodings = ["utf-8", "utf-8-sig", "utf-16", "cp1252", "latin-1"]
+    separators = [",", "\t", ";"]
+
+    last_err = None
+    for enc in encodings:
+        for sep in separators:
+            try:
+                uploaded_file.seek(0)
+                df = pd.read_csv(uploaded_file, encoding=enc, sep=sep)
+                if df.shape[1] >= 2:
+                    note = f"encoding={enc}"
+                    if sep != ",":
+                        note += f", sep={'TAB' if sep == chr(9) else repr(sep)}"
+                    return df, note
+            except (UnicodeDecodeError, UnicodeError) as e:
+                last_err = e
+                break  # encoding wrong → no point trying more separators
+            except Exception as e:
+                last_err = e
+                continue
+    raise ValueError(
+        f"Could not read {label}. Tried encodings {encodings} and "
+        f"separators {separators}. Last error: {last_err}"
+    )
+
+# ---------------------------------------------------------------------------
 # Page setup
 # ---------------------------------------------------------------------------
 
@@ -110,53 +148,83 @@ with st.sidebar:
         if st.button("📥 Load & align files", use_container_width=True,
                      disabled=wq_file is None):
             log = []
-            wq_df = pd.read_csv(wq_file)
+            try:
+                wq_df, wq_note = read_csv_resilient(wq_file, "water quality file")
+            except Exception as e:
+                st.error(f"Couldn't read the WQ file: {e}")
+                st.stop()
             wq_ts = detect_timestamp_column(wq_df)
             if wq_ts is None:
                 st.error("Couldn't auto-detect a timestamp column in the WQ file.")
                 st.stop()
-            log.append(f"WQ: {len(wq_df):,} rows. Timestamp column: '{wq_ts}'.")
+            log.append(
+                f"WQ: {len(wq_df):,} rows, {wq_note}. "
+                f"Timestamp column: '{wq_ts}'."
+            )
 
             merged = wq_df.copy()
 
             # ---- Rainfall alignment ----
             if rain_file is not None:
-                rain_df = pd.read_csv(rain_file)
-                rain_ts = detect_timestamp_column(rain_df)
-                if rain_ts is None:
-                    log.append("⚠️ Rainfall file: couldn't detect timestamp column — skipped.")
-                else:
-                    # Use all non-timestamp columns as rainfall value cols
-                    rain_value_cols = [c for c in rain_df.columns if c != rain_ts]
-                    merged, diag = align_to_grid(
-                        merged, wq_ts, rain_df, rain_ts,
-                        rain_value_cols, tolerance_minutes=tol_min,
-                    )
-                    for vc in rain_value_cols:
+                try:
+                    rain_df, rain_note = read_csv_resilient(rain_file, "rainfall file")
+                except Exception as e:
+                    log.append(f"⚠️ Rainfall file: couldn't read — {e}. Skipped.")
+                    rain_df = None
+                if rain_df is not None:
+                    rain_ts = detect_timestamp_column(rain_df)
+                    if rain_ts is None:
                         log.append(
-                            f"Rainfall '{vc}': {diag[f'{vc}_matched']:,} / "
-                            f"{diag['target_rows']:,} matched "
-                            f"({diag[f'{vc}_match_pct']}%) within {tol_min} min."
+                            f"⚠️ Rainfall file ({rain_note}): couldn't detect "
+                            f"timestamp column — skipped."
                         )
+                    else:
+                        rain_value_cols = [c for c in rain_df.columns if c != rain_ts]
+                        merged, diag = align_to_grid(
+                            merged, wq_ts, rain_df, rain_ts,
+                            rain_value_cols, tolerance_minutes=tol_min,
+                        )
+                        log.append(
+                            f"Rainfall: {len(rain_df):,} rows, {rain_note}. "
+                            f"Timestamp column: '{rain_ts}'."
+                        )
+                        for vc in rain_value_cols:
+                            log.append(
+                                f"  └ '{vc}': {diag[f'{vc}_matched']:,} / "
+                                f"{diag['target_rows']:,} matched "
+                                f"({diag[f'{vc}_match_pct']}%) within {tol_min} min."
+                            )
 
             # ---- Stage alignment ----
             if stage_file is not None:
-                stage_df = pd.read_csv(stage_file)
-                stage_ts = detect_timestamp_column(stage_df)
-                if stage_ts is None:
-                    log.append("⚠️ Stage file: couldn't detect timestamp column — skipped.")
-                else:
-                    stage_value_cols = [c for c in stage_df.columns if c != stage_ts]
-                    merged, diag = align_to_grid(
-                        merged, wq_ts, stage_df, stage_ts,
-                        stage_value_cols, tolerance_minutes=tol_min,
-                    )
-                    for vc in stage_value_cols:
+                try:
+                    stage_df, stage_note = read_csv_resilient(stage_file, "stage file")
+                except Exception as e:
+                    log.append(f"⚠️ Stage file: couldn't read — {e}. Skipped.")
+                    stage_df = None
+                if stage_df is not None:
+                    stage_ts = detect_timestamp_column(stage_df)
+                    if stage_ts is None:
                         log.append(
-                            f"Stage '{vc}': {diag[f'{vc}_matched']:,} / "
-                            f"{diag['target_rows']:,} matched "
-                            f"({diag[f'{vc}_match_pct']}%) within {tol_min} min."
+                            f"⚠️ Stage file ({stage_note}): couldn't detect "
+                            f"timestamp column — skipped."
                         )
+                    else:
+                        stage_value_cols = [c for c in stage_df.columns if c != stage_ts]
+                        merged, diag = align_to_grid(
+                            merged, wq_ts, stage_df, stage_ts,
+                            stage_value_cols, tolerance_minutes=tol_min,
+                        )
+                        log.append(
+                            f"Stage: {len(stage_df):,} rows, {stage_note}. "
+                            f"Timestamp column: '{stage_ts}'."
+                        )
+                        for vc in stage_value_cols:
+                            log.append(
+                                f"  └ '{vc}': {diag[f'{vc}_matched']:,} / "
+                                f"{diag['target_rows']:,} matched "
+                                f"({diag[f'{vc}_match_pct']}%) within {tol_min} min."
+                            )
 
             st.session_state.data = merged
             st.session_state.alignment_log = log
