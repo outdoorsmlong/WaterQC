@@ -33,15 +33,20 @@ warnings.filterwarnings("ignore")
 
 @dataclass
 class ParameterConfig:
-    """Per-parameter QC settings."""
+    """Per-parameter QC settings.
+
+    Note: defaults use large finite sentinels rather than np.inf, because
+    Streamlit's number_input widget cannot serialize infinity to JavaScript.
+    A range_min of -1e9 is effectively "no lower bound" for any real sensor.
+    """
     name: str
     units: str = ""
-    range_min: float = -np.inf
-    range_max: float = np.inf
+    range_min: float = -1e9
+    range_max: float = 1e9
     spike_threshold: float = 4.0          # z-score on first differences
     persistence_window: int = 6           # consecutive identical readings
     persistence_tol: float = 1e-6
-    max_rate_change: float = np.inf       # per hour
+    max_rate_change: float = 1e9          # per hour (effectively unlimited)
     use_arima: bool = False
     arima_order: tuple = (2, 0, 1)
     arima_threshold: float = 3.5
@@ -138,7 +143,7 @@ class WaterQualityQCv2:
         return flat & (run_lengths >= cfg.persistence_window)
 
     def _flag_rate(self, series: pd.Series, cfg: ParameterConfig) -> pd.Series:
-        if cfg.max_rate_change == np.inf:
+        if cfg.max_rate_change >= 1e9:
             return pd.Series(False, index=series.index)
         dt_hours = (
             self.data[self.timestamp_col]
