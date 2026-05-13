@@ -45,11 +45,20 @@ Your browser opens at `http://localhost:8501`. Press **Ctrl+C** in the terminal 
 Just needs a timestamp column and one or more numeric parameter columns:
 
 ```
-datetime,temperature,ph,dissolved_oxygen,turbidity
-2024-01-01 00:00,58.2,7.51,9.1,4.8
-2024-01-01 00:15,58.4,7.49,9.0,4.9
+datetime,temperature,ph,dissolved_oxygen,turbidity,rainfall,stage
+2024-01-01 00:00,58.2,7.51,9.1,4.8,0.0,2.51
+2024-01-01 00:15,58.4,7.49,9.0,4.9,0.0,2.52
 ...
 ```
+
+**Optional covariates** — rainfall and stage columns let the tool:
+1. **Suppress false-positive flags during real hydrologic events.** A turbidity
+   spike during a rain event is real, not a sensor fault. So is a DO drop
+   during a flood, or a conductivity dilution during a storm.
+2. **Inform correction estimates via regression.** When a point IS flagged
+   as a fault, the corrected value comes from a regression that uses
+   rainfall and stage as predictors (cross-faded with linear interpolation
+   at the gap edges, PyHydroQC-style).
 
 Column names are flexible — you map them in the UI. Temperature defaults
 are in **°F**; the DO saturation check converts to °C internally.
