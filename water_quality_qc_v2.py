@@ -517,6 +517,103 @@ class WaterQualityQCv2:
 # Demo data generator (used by the Streamlit app's "Try demo data" button)
 # ---------------------------------------------------------------------------
 
+# ---------------------------------------------------------------------------
+# Multi-file timestamp alignment
+# ---------------------------------------------------------------------------
+
+def detect_timestamp_column(df: pd.DataFrame) -> Optional[str]:
+    """Best-effort: pick the column that looks most like a timestamp.
+
+    Strategy:
+      1. Column names containing 'time', 'date', 'datetime', 'stamp'
+      2. Fall back to first column whose values parse as datetimes
+    """
+    name_hints = ("datetime", "timestamp", "time", "date")
+    for c in df.columns:
+        cl = c.lower()
+        if any(h in cl for h in name_hints):
+            try:
+                pd.to_datetime(df[c].head(50), errors="raise")
+                return c
+            except Exception:
+                continue
+    # Fallback: try each column
+    for c in df.columns:
+        try:
+            parsed = pd.to_datetime(df[c].head(50), errors="raise")
+            if parsed.notna().all():
+                return c
+        except Exception:
+            continue
+    return None
+
+
+def align_to_grid(
+    target: pd.DataFrame,
+    target_ts_col: str,
+    external: pd.DataFrame,
+    external_ts_col: str,
+    value_cols: list[str],
+    tolerance_minutes: float = 10.0,
+) -> tuple[pd.DataFrame, dict]:
+    """Align external (rainfall or stage) data to the target timestamp grid.
+
+    For each row in `target`, find the nearest external observation within
+    `tolerance_minutes`. Points outside tolerance become NaN.
+
+    For rainfall (typically a *rate* measured at points), this gives the
+    nearest sample. For cumulative rainfall, the caller should difference
+    first.
+
+    Returns:
+        merged: copy of `target` with the external value columns appended
+        diag:   dict with alignment quality metrics
+    """
+    t = target[[target_ts_col]].copy()
+    t[target_ts_col] = pd.to_datetime(t[target_ts_col], errors="coerce")
+    # merge_asof requires non-null keys; drop rows with bad timestamps
+    t_valid = t.dropna(subset=[target_ts_col]).sort_values(target_ts_col).reset_index()
+    t_valid = t_valid.rename(columns={"index": "_orig_idx"})
+
+    e = external.copy()
+    e[external_ts_col] = pd.to_datetime(e[external_ts_col], errors="coerce")
+    e = e.dropna(subset=[external_ts_col])
+    keep = [external_ts_col] + value_cols
+    e = e[keep].sort_values(external_ts_col).reset_index(drop=True)
+
+    # merge_asof does nearest-neighbor with a tolerance
+    merged_valid = pd.merge_asof(
+        t_valid, e,
+        left_on=target_ts_col, right_on=external_ts_col,
+        direction="nearest",
+        tolerance=pd.Timedelta(minutes=tolerance_minutes),
+    )
+
+    # Build the full-length result, putting NaN for rows whose target timestamp was bad
+    full = target.copy()
+    full[target_ts_col] = pd.to_datetime(full[target_ts_col], errors="coerce")
+    full = full.sort_values(target_ts_col).reset_index(drop=True)
+    for vc in value_cols:
+        col = pd.Series(np.nan, index=full.index, dtype="float64")
+        # Map valid rows by their original index
+        col.iloc[merged_valid["_orig_idx"].values] = merged_valid[vc].values
+        full[vc] = col.values
+
+    # Diagnostics
+    diag = {
+        "target_rows": len(full),
+        "target_rows_valid_ts": len(t_valid),
+        "external_rows": len(e),
+        "tolerance_min": tolerance_minutes,
+    }
+    for vc in value_cols:
+        matched = full[vc].notna().sum()
+        diag[f"{vc}_matched"] = int(matched)
+        diag[f"{vc}_match_pct"] = round(100 * matched / len(full), 1) if len(full) else 0
+
+    return full, diag
+
+
 def generate_demo_data(n: int = 5000, seed: int = 42) -> pd.DataFrame:
     """Synthetic Fahrenheit water-quality time series with rainfall + stage.
 
@@ -563,8 +660,8 @@ def generate_demo_data(n: int = 5000, seed: int = 42) -> pd.DataFrame:
                 fall = max(0, 1 - (i - duration * 0.6) / (duration * 2))
                 stage[idx] += 1.8 * rise_pct * fall
 
-    storm(start=800, peak_in_per_step=0.08, duration=40)   # ~10 hr event
-    storm(start=2200, peak_in_per_step=0.05, duration=30)  # ~7.5 hr event
+    storm(start=int(n * 0.16), peak_in_per_step=0.08, duration=40)   # ~10 hr event
+    storm(start=int(n * 0.44), peak_in_per_step=0.05, duration=30)   # ~7.5 hr event
 
     # ---- Real WQ responses to storms (NOT anomalies) ----
     rain_roll = pd.Series(rainfall).rolling(12, min_periods=1).sum().values

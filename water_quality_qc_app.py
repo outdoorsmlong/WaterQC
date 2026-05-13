@@ -23,6 +23,8 @@ from water_quality_qc_v2 import (
     ParameterConfig,
     PARAMETER_CONFIGS,
     generate_demo_data,
+    detect_timestamp_column,
+    align_to_grid,
 )
 
 # ---------------------------------------------------------------------------
@@ -50,32 +52,115 @@ if "data" not in st.session_state:
     st.session_state.data = None
 if "qc" not in st.session_state:
     st.session_state.qc = None
+if "alignment_log" not in st.session_state:
+    st.session_state.alignment_log = []
 
 # ---------------------------------------------------------------------------
-# Sidebar: data source
+# Sidebar: data sources (WQ + optional rainfall + optional stage)
 # ---------------------------------------------------------------------------
 
 with st.sidebar:
-    st.header("1. Data source")
+    st.header("1. Data sources")
 
     source = st.radio(
         "Choose data source",
-        ["Upload CSV", "Try demo data"],
+        ["Upload CSV files", "Try demo data"],
         label_visibility="collapsed",
     )
 
-    if source == "Upload CSV":
-        uploaded = st.file_uploader(
-            "CSV with a timestamp column + parameter columns",
-            type=["csv"],
-        )
-        if uploaded is not None:
-            st.session_state.data = pd.read_csv(uploaded)
-            st.success(f"Loaded {len(st.session_state.data):,} rows")
-    else:
+    if source == "Try demo data":
         if st.button("Generate demo data", use_container_width=True):
             st.session_state.data = generate_demo_data()
+            st.session_state.alignment_log = [
+                "Demo data: rainfall + stage already on the WQ grid (no alignment needed)."
+            ]
             st.success(f"Generated {len(st.session_state.data):,} rows of demo data")
+    else:
+        st.markdown("**Water quality CSV** *(required)*")
+        wq_file = st.file_uploader(
+            "Timestamp + parameter columns",
+            type=["csv"], key="wq_upload",
+            label_visibility="collapsed",
+        )
+
+        st.markdown("**Rainfall CSV** *(optional, separate file)*")
+        rain_file = st.file_uploader(
+            "Timestamp + rainfall column",
+            type=["csv"], key="rain_upload",
+            label_visibility="collapsed",
+        )
+
+        st.markdown("**Stage CSV** *(optional, separate file)*")
+        stage_file = st.file_uploader(
+            "Timestamp + stage column",
+            type=["csv"], key="stage_upload",
+            label_visibility="collapsed",
+        )
+
+        tol_min = st.number_input(
+            "Timestamp alignment tolerance (minutes)",
+            min_value=0.5, max_value=120.0, value=10.0, step=0.5,
+            help=(
+                "When matching rainfall/stage to the WQ grid, samples outside "
+                "this window become NaN. Use ~half your WQ sampling interval "
+                "as a starting point (e.g. 7.5 min for 15-min WQ data)."
+            ),
+        )
+
+        if st.button("📥 Load & align files", use_container_width=True,
+                     disabled=wq_file is None):
+            log = []
+            wq_df = pd.read_csv(wq_file)
+            wq_ts = detect_timestamp_column(wq_df)
+            if wq_ts is None:
+                st.error("Couldn't auto-detect a timestamp column in the WQ file.")
+                st.stop()
+            log.append(f"WQ: {len(wq_df):,} rows. Timestamp column: '{wq_ts}'.")
+
+            merged = wq_df.copy()
+
+            # ---- Rainfall alignment ----
+            if rain_file is not None:
+                rain_df = pd.read_csv(rain_file)
+                rain_ts = detect_timestamp_column(rain_df)
+                if rain_ts is None:
+                    log.append("⚠️ Rainfall file: couldn't detect timestamp column — skipped.")
+                else:
+                    # Use all non-timestamp columns as rainfall value cols
+                    rain_value_cols = [c for c in rain_df.columns if c != rain_ts]
+                    merged, diag = align_to_grid(
+                        merged, wq_ts, rain_df, rain_ts,
+                        rain_value_cols, tolerance_minutes=tol_min,
+                    )
+                    for vc in rain_value_cols:
+                        log.append(
+                            f"Rainfall '{vc}': {diag[f'{vc}_matched']:,} / "
+                            f"{diag['target_rows']:,} matched "
+                            f"({diag[f'{vc}_match_pct']}%) within {tol_min} min."
+                        )
+
+            # ---- Stage alignment ----
+            if stage_file is not None:
+                stage_df = pd.read_csv(stage_file)
+                stage_ts = detect_timestamp_column(stage_df)
+                if stage_ts is None:
+                    log.append("⚠️ Stage file: couldn't detect timestamp column — skipped.")
+                else:
+                    stage_value_cols = [c for c in stage_df.columns if c != stage_ts]
+                    merged, diag = align_to_grid(
+                        merged, wq_ts, stage_df, stage_ts,
+                        stage_value_cols, tolerance_minutes=tol_min,
+                    )
+                    for vc in stage_value_cols:
+                        log.append(
+                            f"Stage '{vc}': {diag[f'{vc}_matched']:,} / "
+                            f"{diag['target_rows']:,} matched "
+                            f"({diag[f'{vc}_match_pct']}%) within {tol_min} min."
+                        )
+
+            st.session_state.data = merged
+            st.session_state.alignment_log = log
+            st.success(f"Loaded and aligned: {len(merged):,} rows × {len(merged.columns)} columns.")
 
 # ---------------------------------------------------------------------------
 # Main area: only show once data is loaded
@@ -89,6 +174,18 @@ if st.session_state.data is None:
     st.stop()
 
 data = st.session_state.data
+
+# ----- Alignment log ------------------------------------------------------
+
+if st.session_state.alignment_log:
+    with st.expander("🔗 File alignment log", expanded=True):
+        for line in st.session_state.alignment_log:
+            st.markdown(f"- {line}")
+        st.caption(
+            "Tip: if match % is lower than expected, your timestamps may be in "
+            "different timezones, or the tolerance may be too tight. "
+            "Unmatched rows become NaN, which the QC engine handles safely."
+        )
 
 # ----- Preview ------------------------------------------------------------
 

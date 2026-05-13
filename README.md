@@ -42,16 +42,38 @@ Your browser opens at `http://localhost:8501`. Press **Ctrl+C** in the terminal 
 
 ## CSV format
 
-Just needs a timestamp column and one or more numeric parameter columns:
+**Water quality file** — timestamp column + one or more numeric parameter columns:
 
 ```
-datetime,temperature,ph,dissolved_oxygen,turbidity,rainfall,stage
-2024-01-01 00:00,58.2,7.51,9.1,4.8,0.0,2.51
-2024-01-01 00:15,58.4,7.49,9.0,4.9,0.0,2.52
+datetime,temperature,ph,dissolved_oxygen,turbidity
+2024-01-01 00:00,58.2,7.51,9.1,4.8
+2024-01-01 00:15,58.4,7.49,9.0,4.9
 ...
 ```
 
-**Optional covariates** — rainfall and stage columns let the tool:
+**Rainfall and stage files** — separate uploads, with their own timestamp columns:
+
+```
+# rainfall.csv (might be 5-min data from a different logger)
+TIMESTAMP,rain_inches
+2024-01-01 00:00:00,0.000
+2024-01-01 00:05:00,0.001
+...
+
+# stage.csv (might be 1-min data from a PT)
+date_time,stage_ft
+2024-01-01 00:00:00,2.51
+2024-01-01 00:01:00,2.51
+...
+```
+
+**You don't need matching timestamps.** The app detects each file's timestamp
+column automatically and uses nearest-neighbor matching (within your chosen
+tolerance, default 10 min) to align everything onto the WQ grid. The
+alignment log shows you the match rate, so you can spot timezone mismatches
+or logger drift.
+
+**Optional covariates** let the tool:
 1. **Suppress false-positive flags during real hydrologic events.** A turbidity
    spike during a rain event is real, not a sensor fault. So is a DO drop
    during a flood, or a conductivity dilution during a storm.
@@ -60,8 +82,8 @@ datetime,temperature,ph,dissolved_oxygen,turbidity,rainfall,stage
    rainfall and stage as predictors (cross-faded with linear interpolation
    at the gap edges, PyHydroQC-style).
 
-Column names are flexible — you map them in the UI. Temperature defaults
-are in **°F**; the DO saturation check converts to °C internally.
+Column names are flexible — the app maps them automatically. Temperature
+defaults are in **°F**; the DO saturation check converts to °C internally.
 
 ## Customizing the engine
 
