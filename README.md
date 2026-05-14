@@ -8,10 +8,38 @@ in the background — you interact through a browser.
 | File | Purpose |
 |------|---------|
 | `water_quality_qc_app.py` | The web UI (Streamlit) |
-| `water_quality_qc_v2.py` | The QC engine (called by the UI) |
+| `water_quality_qc_v2.py` | The rules-based QC engine |
+| `lstm_models.py` | LSTM forecast + correction models (PyHydroQC-style) |
 | `requirements.txt` | Libraries to install |
 | `Run_QC_Tool.bat` | Windows launcher (double-click) |
 | `Run_QC_Tool.sh` | Mac/Linux launcher |
+
+## LSTM workflow (Jones 2022 / PyHydroQC)
+
+The **Train LSTM** and **LSTM Detect & Validate** tabs implement the supervised
+workflow from Amber Jones' PyHydroQC paper:
+
+1. **Retrieve data** — raw uncorrected stream loaded on the main page.
+2. **Rules-based screening** — the *Rules-based QC* tab handles this.
+3. **Develop a model** — *Train LSTM* tab. Upload your *clean* (corrected)
+   dataset with matching timestamps. The app trains two models per parameter:
+   a **forecast** LSTM (predicts the next clean value from past + covariates)
+   and a **correction** LSTM (maps raw windows directly to clean values).
+4. **Apply model** — *LSTM Detect & Validate* tab. Runs the forecast model
+   on the raw stream and computes residuals.
+5. **Dynamic threshold** — anomalies are flagged where `|residual| >
+   mean(|residual|) + k * std(|residual|)` over a rolling window. k is
+   tunable (default 4.0).
+6. **Window widening** — flagged points get their neighbors checked too,
+   so you catch the full extent of each event rather than just the peak.
+7. **Validation metrics** — precision, recall, F1, and confusion-matrix
+   counts vs. ground truth derived from your clean dataset (`raw ≠ clean`
+   within a per-parameter tolerance).
+8. **Correction** — flagged points can be replaced with the correction
+   LSTM's output, or fall back to the rules-based regression approach.
+
+Trained models are saved as `.keras` files in `./models/<parameter>/` so
+training is a one-time cost. Future runs just load the model and apply it.
 
 ## Setup (one time)
 
