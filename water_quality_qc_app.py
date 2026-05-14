@@ -12,6 +12,7 @@ The Python framework (water_quality_qc_v2.py) runs in the background.
 
 import io
 import zipfile
+from dataclasses import asdict
 from pathlib import Path
 
 import pandas as pd
@@ -25,6 +26,11 @@ from water_quality_qc_v2 import (
     generate_demo_data,
     detect_timestamp_column,
     align_to_grid,
+)
+
+from preset_loader import (
+    list_presets, configs_from_preset, auto_map_columns,
+    preset_to_session_state,
 )
 
 # LSTM is optional — only enable if both the module AND TensorFlow are present
@@ -291,22 +297,87 @@ tab_rules, tab_train, tab_lstm = st.tabs([
 
 with tab_rules:
 
+    # ----- Station preset selector --------------------------------------------
+
+    st.subheader("1b. Station preset (optional)")
+    st.caption(
+        "Load saved settings for a specific monitoring station. Presets pre-fill "
+        "thresholds, column mappings, and event-aware behavior. You can still "
+        "override any value below."
+    )
+
+    presets = list_presets("presets")
+    preset_labels = ["— No preset (use defaults) —"] + [
+        f"{p['station_name']}"
+        + (f"  ({p['n_parameters']} params)" if p['n_parameters'] else "")
+        for p in presets
+    ]
+    preset_choice = st.selectbox(
+        "Select a station preset",
+        options=range(len(preset_labels)),
+        format_func=lambda i: preset_labels[i],
+        index=0,
+        label_visibility="collapsed",
+    )
+
+    active_preset = None
+    if preset_choice > 0:
+        active_preset = presets[preset_choice - 1]
+        if active_preset["_data"]:
+            with st.expander(
+                f"ℹ️ About: {active_preset['station_name']}", expanded=False
+            ):
+                if active_preset["description"]:
+                    st.write(active_preset["description"])
+                st.caption(
+                    f"Source: `{active_preset['filename']}`  •  "
+                    f"Sampling: {active_preset['_data'].get('sampling_interval_minutes', '?')} min  •  "
+                    f"Version: {active_preset['_data'].get('version', '?')}  •  "
+                    f"Last updated: {active_preset['_data'].get('last_updated', '?')}"
+                )
+        else:
+            active_preset = None  # invalid preset
+            st.warning("Selected preset is invalid — proceeding with defaults.")
+
+    # If a preset is active, build auto-map suggestions
+    auto_map = {}
+    if active_preset and active_preset["_data"]:
+        auto_map = auto_map_columns(data.columns.tolist(), active_preset["_data"])
+
     # ----- Column mapping -----------------------------------------------------
 
     st.subheader("2. Map your columns")
+
+    # Pre-select timestamp from auto-map if available
+    ts_default_idx = 0
+    if auto_map.get("timestamp") in data.columns:
+        ts_default_idx = data.columns.tolist().index(auto_map["timestamp"])
 
     col1, col2 = st.columns([1, 2])
     with col1:
         ts_col = st.selectbox(
             "Timestamp column",
             options=data.columns.tolist(),
-            index=0,
+            index=ts_default_idx,
         )
+
+    # Default parameters: auto-map results if preset is active, else
+    # any column matching PARAMETER_CONFIGS keys
+    if active_preset and auto_map:
+        default_params = [
+            auto_map[k] for k in
+            ["pH", "temperature", "turbidity", "specific_conductivity",
+             "dissolved_oxygen", "stage"]
+            if auto_map.get(k) and auto_map[k] in data.columns and auto_map[k] != ts_col
+        ]
+    else:
+        default_params = [c for c in data.columns if c in PARAMETER_CONFIGS]
+
     with col2:
         param_cols = st.multiselect(
             "Parameter columns to QC",
             options=[c for c in data.columns if c != ts_col],
-            default=[c for c in data.columns if c in PARAMETER_CONFIGS],
+            default=default_params,
         )
 
     # ----- Covariate mapping (rainfall + stage) -------------------------------
@@ -319,35 +390,49 @@ with tab_rules:
     )
 
     cv1, cv2 = st.columns(2)
+    # Determine preset defaults for covariates
+    if active_preset and active_preset["_data"]:
+        _cov_defaults = active_preset["_data"].get("covariates", {})
+        _rain_default = auto_map.get("rainfall") if auto_map.get("rainfall") in data.columns else None
+        _stage_default = auto_map.get("stage") if auto_map.get("stage") in data.columns else None
+        _rain_win_default = float(_cov_defaults.get("rain_window_hr", 1.0))
+        _rain_thr_default = float(_cov_defaults.get("rain_event_threshold", 0.05))
+        _stage_q_default = float(_cov_defaults.get("stage_high_quantile", 0.90))
+    else:
+        _rain_default = "rainfall" if "rainfall" in data.columns else None
+        _stage_default = "stage" if "stage" in data.columns else None
+        _rain_win_default = 1.0
+        _rain_thr_default = 0.05
+        _stage_q_default = 0.90
+
+    _rain_options = ["— none —"] + [c for c in data.columns if c != ts_col]
+    _stage_options = ["— none —"] + [c for c in data.columns if c != ts_col]
+
     with cv1:
         rainfall_col = st.selectbox(
             "Rainfall column (e.g. inches per timestep)",
-            options=["— none —"] + [c for c in data.columns if c not in (ts_col,)],
-            index=(
-                (["— none —"] + [c for c in data.columns if c not in (ts_col,)]).index("rainfall")
-                if "rainfall" in data.columns else 0
-            ),
+            options=_rain_options,
+            index=_rain_options.index(_rain_default) if _rain_default in _rain_options else 0,
         )
         rain_window_hr = st.number_input(
             "Rolling window for rain events (hr)",
-            min_value=0.25, max_value=24.0, value=1.0, step=0.25,
+            min_value=0.25, max_value=24.0,
+            value=_rain_win_default, step=0.25,
         )
         rain_event_threshold = st.number_input(
             "Rain total over window to call it an 'event' (same units as rainfall col)",
-            min_value=0.0, value=0.05, step=0.01, format="%.3f",
+            min_value=0.0, value=_rain_thr_default, step=0.01, format="%.3f",
         )
     with cv2:
         stage_col = st.selectbox(
             "Stage column (PT or radar, ft/m)",
-            options=["— none —"] + [c for c in data.columns if c not in (ts_col,)],
-            index=(
-                (["— none —"] + [c for c in data.columns if c not in (ts_col,)]).index("stage")
-                if "stage" in data.columns else 0
-            ),
+            options=_stage_options,
+            index=_stage_options.index(_stage_default) if _stage_default in _stage_options else 0,
         )
         stage_high_quantile = st.slider(
             "Stage quantile considered 'high stage'",
-            min_value=0.50, max_value=0.99, value=0.90, step=0.01,
+            min_value=0.50, max_value=0.99,
+            value=_stage_q_default, step=0.01,
         )
 
     # Convert "none" sentinel to None
@@ -370,10 +455,26 @@ with tab_rules:
         return float(value)
 
 
+    # If a preset is active, build a map from (actual column name) -> ParameterConfig
+    preset_configs_by_col: dict[str, ParameterConfig] = {}
+    if active_preset and active_preset["_data"]:
+        preset_canon_configs = configs_from_preset(active_preset["_data"])
+        # auto_map: canonical -> actual column. Invert it.
+        canon_to_col = {k: v for k, v in auto_map.items() if v}
+        for canon, cfg in preset_canon_configs.items():
+            actual_col = canon_to_col.get(canon)
+            if actual_col:
+                # Re-create config with the actual column name as `name` so it
+                # round-trips through the existing per-param loop unchanged
+                cfg_dict = {**asdict(cfg), "name": actual_col}
+                preset_configs_by_col[actual_col] = ParameterConfig(**cfg_dict)
+
     custom_configs: dict[str, ParameterConfig] = {}
     for p in param_cols:
-        default = PARAMETER_CONFIGS.get(p, ParameterConfig(name=p))
-        with st.expander(f"⚙️ {p} ({default.units or 'no units'})"):
+        # Priority: preset > built-in default > blank
+        default = preset_configs_by_col.get(p) or PARAMETER_CONFIGS.get(p) or ParameterConfig(name=p)
+        preset_tag = " (from preset)" if p in preset_configs_by_col else ""
+        with st.expander(f"⚙️ {p} ({default.units or 'no units'}){preset_tag}"):
             c1, c2, c3 = st.columns(3)
             with c1:
                 rmin = st.number_input(

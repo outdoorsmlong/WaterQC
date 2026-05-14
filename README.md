@@ -1,154 +1,99 @@
-# 💧 Water Quality QC Tool
+# Station Preset Library
 
-A web-based UI for the water quality QC framework. The Python QC engine runs
-in the background — you interact through a browser.
+Each `.json` file in this folder is a **station preset** — a saved configuration
+for one monitoring station that the app loads with a single dropdown click.
 
-## What you got
+## How presets work
 
-| File | Purpose |
-|------|---------|
-| `water_quality_qc_app.py` | The web UI (Streamlit) |
-| `water_quality_qc_v2.py` | The rules-based QC engine |
-| `lstm_models.py` | LSTM forecast + correction models (PyHydroQC-style) |
-| `requirements.txt` | Libraries to install |
-| `Run_QC_Tool.bat` | Windows launcher (double-click) |
-| `Run_QC_Tool.sh` | Mac/Linux launcher |
+The app scans this folder on startup and lists every `.json` file in a
+dropdown at the top of the Rules-based QC tab. Selecting a preset auto-fills:
 
-## LSTM workflow (Jones 2022 / PyHydroQC)
+- The expected column names (rainfall, stage, parameter columns)
+- Per-parameter thresholds (range, spike, persistence, max rate)
+- Event-aware behavior (which flags to suppress during rain/high stage)
+- Covariate settings (rolling rainfall window, stage quantile)
 
-The **Train LSTM** and **LSTM Detect & Validate** tabs implement the supervised
-workflow from Amber Jones' PyHydroQC paper:
+Any auto-detected column that matches an alias in the preset is mapped
+automatically. You can override any value in the UI after loading — presets
+are starting points, not locked configs.
 
-1. **Retrieve data** — raw uncorrected stream loaded on the main page.
-2. **Rules-based screening** — the *Rules-based QC* tab handles this.
-3. **Develop a model** — *Train LSTM* tab. Upload your *clean* (corrected)
-   dataset with matching timestamps. The app trains two models per parameter:
-   a **forecast** LSTM (predicts the next clean value from past + covariates)
-   and a **correction** LSTM (maps raw windows directly to clean values).
-4. **Apply model** — *LSTM Detect & Validate* tab. Runs the forecast model
-   on the raw stream and computes residuals.
-5. **Dynamic threshold** — anomalies are flagged where `|residual| >
-   mean(|residual|) + k * std(|residual|)` over a rolling window. k is
-   tunable (default 4.0).
-6. **Window widening** — flagged points get their neighbors checked too,
-   so you catch the full extent of each event rather than just the peak.
-7. **Validation metrics** — precision, recall, F1, and confusion-matrix
-   counts vs. ground truth derived from your clean dataset (`raw ≠ clean`
-   within a per-parameter tolerance).
-8. **Correction** — flagged points can be replaced with the correction
-   LSTM's output, or fall back to the rules-based regression approach.
+## Built-in presets
 
-Trained models are saved as `.keras` files in `./models/<parameter>/` so
-training is a one-time cost. Future runs just load the model and apply it.
+| File | Use for |
+|---|---|
+| `KINA.json` | KIN_A station — Cooper River-area site, derived from 87 days of corrected data |
+| `_generic_freshwater.json` | Default starting point for any new freshwater stream |
+| `_generic_tidal.json` | Estuarine/brackish sites with high specific conductivity |
+| `_generic_mountain.json` | Cold-water oligotrophic mountain streams |
 
-## Setup (one time)
+Files starting with `_` are sorted to the bottom of the dropdown so your
+station-specific presets show first.
 
-1. **Install Python 3.11 or 3.12** from https://www.python.org/downloads/
-   - ⚠️ TensorFlow does **not** yet support Python 3.13 or 3.14. If you only
-     want the rules-based features, any Python ≥3.9 will work.
-   - ⚠️ On Windows, check **"Add Python to PATH"** during install.
-2. **Install libraries.** Open Terminal / Command Prompt in this folder:
-   ```
-   pip install -r requirements.txt
-   ```
-   For LSTM features, also install:
-   ```
-   pip install -r requirements-lstm.txt
-   ```
+## Adding a new station
 
-## Deploying to Streamlit Cloud
+1. Copy an existing preset that resembles your site (e.g., `KINA.json`).
+2. Rename it to your station ID (e.g., `KIN_B.json`, `Site_42.json`).
+3. Open in any text editor and update:
+   - `station_id`, `station_name`, `description`
+   - `column_aliases` — list every name your CSVs use for each parameter
+   - `parameters.<param>.range_min`, `range_max`, etc.
+4. Save. The next time the app starts, your new preset appears in the dropdown.
 
-The repo includes `.python-version` (set to `3.11`) and `runtime.txt`
-(set to `python-3.11`) so Streamlit Cloud picks a TF-compatible Python.
-If you don't need LSTM features, you can delete those files and use any
-default Python.
+## Deriving thresholds from your data
 
-To include LSTM features on Streamlit Cloud, **append** the contents of
-`requirements-lstm.txt` to `requirements.txt` before pushing — Streamlit
-Cloud only reads `requirements.txt`. Note: TF on the free tier is memory-
-constrained; training large models may fail. Recommended approach is to
-train locally and commit the `models/` folder for the cloud app to load.
+For each parameter, run this against ~3 months of your cleanest data:
 
-## Run it
+| Threshold | How to derive |
+|---|---|
+| `range_min` / `range_max` | Round outside the observed [p0.1, p99.9] to nice numbers |
+| `spike_threshold` | Start at 4.0; raise if too many false positives, lower if missing real spikes |
+| `persistence_window` | Sampling-rate dependent: 12 samples × 15 min = 3 hours |
+| `max_rate_change` | p99.9 of `|series.diff()|`, multiplied by samples-per-hour, rounded up |
 
-- **Windows:** double-click `Run_QC_Tool.bat`
-- **Mac/Linux:** double-click `Run_QC_Tool.sh` (or `bash Run_QC_Tool.sh` in Terminal)
-- **Manual:** `streamlit run water_quality_qc_app.py`
+The KINA preset is a worked example — it was derived from real raw + clean
+data using exactly this approach.
 
-Your browser opens at `http://localhost:8501`. Press **Ctrl+C** in the terminal to stop.
+## Schema reference
 
-## Using the app
-
-1. **Sidebar → Data source.** Upload a CSV or click *Generate demo data*.
-2. **Map columns.** Pick your timestamp column and which parameter columns to QC.
-3. **Configure thresholds.** Expand each parameter to tweak ranges, spike sensitivity,
-   persistence window, max rate of change, and ARIMA on/off. Defaults are sensible.
-4. **Run QC.** Click the button. Results appear below.
-5. **Download** the flagged CSV, summary report, or both as a zip.
-
-## CSV format
-
-**Water quality file** — timestamp column + one or more numeric parameter columns:
-
+```json
+{
+  "station_id": "string, short identifier",
+  "station_name": "string, human-readable name",
+  "description": "string, free-form notes",
+  "sampling_interval_minutes": 15,
+  "column_aliases": {
+    "timestamp":    ["list", "of", "possible", "column", "names"],
+    "pH":           ["..."],
+    "temperature":  ["..."],
+    "turbidity":    ["..."],
+    "specific_conductivity": ["..."],
+    "dissolved_oxygen": ["..."],
+    "stage":        ["..."],
+    "rainfall":     ["..."]
+  },
+  "covariates": {
+    "rainfall_col_hint":  "preferred column name if available",
+    "stage_col_hint":     "preferred column name if available",
+    "rain_window_hr":     1.0,
+    "rain_event_threshold": 0.05,
+    "stage_high_quantile":  0.90
+  },
+  "parameters": {
+    "temperature": {
+      "units":              "°F",
+      "range_min":          32,
+      "range_max":          95,
+      "spike_threshold":    4.0,
+      "persistence_window": 12,
+      "max_rate_change":    9.0,
+      "suppress_spike_in_rain":            false,
+      "suppress_rate_in_rain":             false,
+      "suppress_range_min_in_high_stage":  false,
+      "use_covariates_for_correction":     false,
+      "notes":              "optional free-form string"
+    }
+  },
+  "version":      "1.0",
+  "last_updated": "YYYY-MM-DD"
+}
 ```
-datetime,temperature,ph,dissolved_oxygen,turbidity
-2024-01-01 00:00,58.2,7.51,9.1,4.8
-2024-01-01 00:15,58.4,7.49,9.0,4.9
-...
-```
-
-**Rainfall and stage files** — separate uploads, with their own timestamp columns:
-
-```
-# rainfall.csv (might be 5-min data from a different logger)
-TIMESTAMP,rain_inches
-2024-01-01 00:00:00,0.000
-2024-01-01 00:05:00,0.001
-...
-
-# stage.csv (might be 1-min data from a PT)
-date_time,stage_ft
-2024-01-01 00:00:00,2.51
-2024-01-01 00:01:00,2.51
-...
-```
-
-**You don't need matching timestamps.** The app detects each file's timestamp
-column automatically and uses nearest-neighbor matching (within your chosen
-tolerance, default 10 min) to align everything onto the WQ grid. The
-alignment log shows you the match rate, so you can spot timezone mismatches
-or logger drift.
-
-**Optional covariates** let the tool:
-1. **Suppress false-positive flags during real hydrologic events.** A turbidity
-   spike during a rain event is real, not a sensor fault. So is a DO drop
-   during a flood, or a conductivity dilution during a storm.
-2. **Inform correction estimates via regression.** When a point IS flagged
-   as a fault, the corrected value comes from a regression that uses
-   rainfall and stage as predictors (cross-faded with linear interpolation
-   at the gap edges, PyHydroQC-style).
-
-Column names are flexible — the app maps them automatically. Temperature
-defaults are in **°F**; the DO saturation check converts to °C internally.
-
-## Customizing the engine
-
-The UI is the easy entry point, but `water_quality_qc_v2.py` is plain Python.
-You can use it directly from a script or notebook:
-
-```python
-import pandas as pd
-from water_quality_qc_v2 import WaterQualityQCv2
-
-df = pd.read_csv("your_data.csv")
-qc = WaterQualityQCv2(
-    data=df,
-    timestamp_col="datetime",
-    parameters=["temperature", "ph", "dissolved_oxygen", "turbidity"],
-)
-qc.run_all_sequential()
-qc.export_flagged_csv("flagged.csv")
-qc.write_summary_report("summary.txt")
-```
-
-That's the adaptability: UI for everyday use, Python underneath when you want it.
