@@ -43,13 +43,31 @@ training is a one-time cost. Future runs just load the model and apply it.
 
 ## Setup (one time)
 
-1. **Install Python 3.9+** from https://www.python.org/downloads/
+1. **Install Python 3.11 or 3.12** from https://www.python.org/downloads/
+   - ⚠️ TensorFlow does **not** yet support Python 3.13 or 3.14. If you only
+     want the rules-based features, any Python ≥3.9 will work.
    - ⚠️ On Windows, check **"Add Python to PATH"** during install.
 2. **Install libraries.** Open Terminal / Command Prompt in this folder:
    ```
    pip install -r requirements.txt
    ```
-   (Takes 2–3 minutes.)
+   For LSTM features, also install:
+   ```
+   pip install -r requirements-lstm.txt
+   ```
+
+## Deploying to Streamlit Cloud
+
+The repo includes `.python-version` (set to `3.11`) and `runtime.txt`
+(set to `python-3.11`) so Streamlit Cloud picks a TF-compatible Python.
+If you don't need LSTM features, you can delete those files and use any
+default Python.
+
+To include LSTM features on Streamlit Cloud, **append** the contents of
+`requirements-lstm.txt` to `requirements.txt` before pushing — Streamlit
+Cloud only reads `requirements.txt`. Note: TF on the free tier is memory-
+constrained; training large models may fail. Recommended approach is to
+train locally and commit the `models/` folder for the cloud app to load.
 
 ## Run it
 

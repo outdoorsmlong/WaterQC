@@ -27,13 +27,20 @@ from water_quality_qc_v2 import (
     align_to_grid,
 )
 
-# LSTM is optional — only load if TF is installed
+# LSTM is optional — only enable if both the module AND TensorFlow are present
 try:
     from lstm_models import (
         LSTMConfig, ParameterLSTM, derive_labels, compute_metrics,
         DEFAULT_LABEL_TOLERANCES,
     )
-    _LSTM_AVAILABLE = True
+    # The module imports without TF (lazy), so check TF directly
+    try:
+        import tensorflow as _tf_check  # noqa: F401
+        _LSTM_AVAILABLE = True
+        _LSTM_IMPORT_ERROR = ""
+    except ImportError as e:
+        _LSTM_AVAILABLE = False
+        _LSTM_IMPORT_ERROR = f"TensorFlow not installed ({e})"
 except ImportError as e:
     _LSTM_AVAILABLE = False
     _LSTM_IMPORT_ERROR = str(e)
@@ -630,9 +637,15 @@ with tab_train:
 
     if not _LSTM_AVAILABLE:
         st.error(
-            "TensorFlow is not installed. Install with:\n"
-            "```\npip install tensorflow scikit-learn\n```\n\n"
-            f"Import error: `{_LSTM_IMPORT_ERROR}`"
+            "**TensorFlow is not installed.** LSTM training and detection "
+            "require it.\n\n"
+            "**To enable locally:**\n"
+            "```\npip install -r requirements-lstm.txt\n```\n\n"
+            "**Streamlit Cloud users:** TensorFlow needs Python 3.9–3.12, "
+            "not 3.13/3.14. Add a `.python-version` file containing `3.11` "
+            "to your repo root, then add `tensorflow>=2.15` and "
+            "`scikit-learn>=1.3` to `requirements.txt`.\n\n"
+            f"Detail: `{_LSTM_IMPORT_ERROR}`"
         )
     else:
         st.caption(
