@@ -614,6 +614,252 @@ def align_to_grid(
     return full, diag
 
 
+# ---------------------------------------------------------------------------
+# Mixed-cadence detection and resampling
+# ---------------------------------------------------------------------------
+
+def detect_column_cadences(
+    df: pd.DataFrame,
+    timestamp_col: str,
+) -> pd.DataFrame:
+    """For each numeric column, estimate its native sampling cadence.
+
+    Many Campbell-logger and similar exports interleave columns at different
+    cadences (e.g. rain at 5-min, sonde at 15-min) in the same CSV, with NaN
+    elsewhere. This helper returns a per-column report.
+
+    Returns a DataFrame with one row per non-timestamp column:
+        column, n_total, n_non_null, pct_non_null,
+        median_interval_min, mode_interval_min,
+        cadence_status ('regular' | 'sparse' | 'irregular')
+    """
+    ts = pd.to_datetime(df[timestamp_col], errors="coerce")
+    out_rows = []
+    for col in df.columns:
+        if col == timestamp_col:
+            continue
+        s = pd.to_numeric(df[col], errors="coerce")
+        valid = s.notna() & ts.notna()
+        n_valid = int(valid.sum())
+        n_total = len(s)
+        if n_valid < 3:
+            out_rows.append({
+                "column": col,
+                "n_total": n_total,
+                "n_non_null": n_valid,
+                "pct_non_null": round(100 * n_valid / max(n_total, 1), 1),
+                "median_interval_min": None,
+                "mode_interval_min": None,
+                "cadence_status": "too few samples",
+            })
+            continue
+        ts_valid = ts[valid].sort_values()
+        deltas = ts_valid.diff().dt.total_seconds().dropna() / 60.0
+        med = float(deltas.median())
+        mod = float(deltas.mode().iloc[0]) if not deltas.mode().empty else med
+        # 'regular' if mode == median (within 10%); 'sparse' if values are a subset of the master grid;
+        # 'irregular' otherwise
+        if abs(med - mod) / max(med, 1e-9) < 0.1:
+            status = "regular"
+        else:
+            status = "irregular"
+        out_rows.append({
+            "column": col,
+            "n_total": n_total,
+            "n_non_null": n_valid,
+            "pct_non_null": round(100 * n_valid / max(n_total, 1), 1),
+            "median_interval_min": round(med, 2),
+            "mode_interval_min": round(mod, 2),
+            "cadence_status": status,
+        })
+    return pd.DataFrame(out_rows)
+
+
+def needs_resampling(cadence_report: pd.DataFrame, tolerance_pct: float = 5.0) -> bool:
+    """True if columns appear to be on different cadences.
+
+    Specifically: if column cadences span >tolerance_pct difference in their
+    mode interval, the file is mixed-cadence and should be resampled.
+    """
+    valid = cadence_report.dropna(subset=["mode_interval_min"])
+    if len(valid) < 2:
+        return False
+    modes = valid["mode_interval_min"].astype(float)
+    if modes.min() == 0:
+        return False
+    span = (modes.max() - modes.min()) / modes.min() * 100
+    return span > tolerance_pct
+
+
+def resample_to_grid(
+    df: pd.DataFrame,
+    timestamp_col: str,
+    target_interval_minutes: float,
+    rainfall_cols: Optional[list[str]] = None,
+) -> tuple[pd.DataFrame, dict]:
+    """Regrid every column to a uniform `target_interval_minutes` grid.
+
+    For most columns: nearest-neighbor within a half-window tolerance.
+    For rainfall columns (incremental accumulation): SUM within each bin.
+
+    Returns:
+        regridded: new dataframe on the uniform grid
+        diag:      dict with diagnostics per column (samples matched, etc.)
+    """
+    rainfall_cols = rainfall_cols or []
+    df = df.copy()
+    df[timestamp_col] = pd.to_datetime(df[timestamp_col], errors="coerce")
+    df = df.dropna(subset=[timestamp_col]).sort_values(timestamp_col)
+
+    t_start = df[timestamp_col].min().floor(f"{int(target_interval_minutes)}min")
+    t_end = df[timestamp_col].max().ceil(f"{int(target_interval_minutes)}min")
+    grid = pd.date_range(t_start, t_end, freq=f"{int(target_interval_minutes)}min")
+
+    out = pd.DataFrame({timestamp_col: grid})
+    diag = {"target_interval_min": target_interval_minutes, "n_target_rows": len(grid)}
+
+    half_window = pd.Timedelta(minutes=target_interval_minutes / 2)
+
+    for col in df.columns:
+        if col == timestamp_col:
+            continue
+        sub = df[[timestamp_col, col]].dropna(subset=[col])
+        if len(sub) == 0:
+            out[col] = np.nan
+            diag[col] = {"n_source": 0, "n_matched": 0}
+            continue
+
+        if col in rainfall_cols:
+            # Sum into bins of target_interval_minutes
+            sub_indexed = sub.set_index(timestamp_col)
+            sub_indexed[col] = pd.to_numeric(sub_indexed[col], errors="coerce")
+            binned = sub_indexed[col].resample(
+                f"{int(target_interval_minutes)}min",
+                label="left", closed="left",
+            ).sum()
+            # Reindex to our grid (this drops the right edge if needed)
+            binned = binned.reindex(grid, fill_value=0.0)
+            out[col] = binned.values
+            diag[col] = {"n_source": len(sub), "n_matched": int((binned > 0).sum()), "method": "sum"}
+        else:
+            # Nearest-neighbor merge
+            sub[col] = pd.to_numeric(sub[col], errors="coerce")
+            merged = pd.merge_asof(
+                out[[timestamp_col]], sub,
+                on=timestamp_col, direction="nearest",
+                tolerance=half_window,
+            )
+            out[col] = merged[col].values
+            diag[col] = {
+                "n_source": len(sub),
+                "n_matched": int(merged[col].notna().sum()),
+                "method": "nearest",
+            }
+
+    return out, diag
+
+
+# ---------------------------------------------------------------------------
+# AQUARIUS-style header detection
+# ---------------------------------------------------------------------------
+
+def detect_csv_header_row(uploaded_or_path, max_scan: int = 50) -> int:
+    """For AQUARIUS, Campbell, or other instrument exports with metadata at
+    the top of the file, find the row index containing actual column headers.
+
+    Heuristics, in order of preference:
+      1. Skip lines starting with '#' (AQUARIUS comments).
+      2. Skip lines whose first non-blank cell is "Id", "id", or a UUID.
+      3. Skip "Units" rows.
+      4. Pick a row where (a) at least 3 cells are non-blank,
+         (b) the first cell is a string that looks like a column name
+         (alphabetic, contains words like 'time', 'date', 'stamp'), and
+         (c) no cells are pure numbers.
+
+    Returns the 0-based row index to pass as `skiprows` to pandas.
+    """
+    # Accept either a file-like or a path
+    if hasattr(uploaded_or_path, "seek"):
+        uploaded_or_path.seek(0)
+        text = uploaded_or_path.read()
+        if isinstance(text, bytes):
+            for enc in ("utf-8", "utf-8-sig", "cp1252", "latin-1", "utf-16"):
+                try:
+                    text = text.decode(enc)
+                    break
+                except UnicodeDecodeError:
+                    continue
+            else:
+                text = text.decode("utf-8", errors="replace")
+        uploaded_or_path.seek(0)
+        lines = text.splitlines()[:max_scan]
+    else:
+        with open(uploaded_or_path, "rb") as f:
+            data = f.read(50_000)
+        for enc in ("utf-8", "utf-8-sig", "cp1252", "latin-1", "utf-16"):
+            try:
+                text = data.decode(enc)
+                break
+            except UnicodeDecodeError:
+                continue
+        else:
+            text = data.decode("utf-8", errors="replace")
+        lines = text.splitlines()[:max_scan]
+
+    import re
+    uuid_re = re.compile(r"^[0-9a-f]{24,}$", re.IGNORECASE)  # mongo-id-like or longer
+    timestamp_hints = ("time", "stamp", "date", "datetime")
+
+    candidates = []  # (row_idx, score)
+
+    for i, line in enumerate(lines):
+        line = line.strip().lstrip("\ufeff")
+        if not line or line.startswith("#"):
+            continue
+        cells = [c.strip().strip('"').strip("'") for c in line.split(",")]
+        non_blank = [c for c in cells if c]
+        if len(non_blank) < 3:
+            continue
+        first = non_blank[0]
+
+        # Reject if first cell looks like a number
+        try:
+            float(first)
+            continue
+        except ValueError:
+            pass
+
+        # Reject if all cells (after the first) look like UUIDs - this is
+        # the "Id" row in Campbell-style exports
+        rest = non_blank[1:]
+        uuid_share = sum(1 for c in rest if uuid_re.match(c)) / max(len(rest), 1)
+        if uuid_share > 0.5:
+            continue
+
+        # Reject obvious "Units" rows: first cell is exactly "Units" or "Unit"
+        if first.lower() in ("units", "unit"):
+            continue
+
+        # Score: prefer rows where the first cell contains a timestamp hint
+        score = 0
+        if any(h in first.lower() for h in timestamp_hints):
+            score += 10
+        # Prefer rows with more non-blank cells
+        score += len(non_blank)
+        # Prefer rows whose cells look like names (alphabetic-ish, not data)
+        alphaish = sum(1 for c in non_blank if any(ch.isalpha() for ch in c))
+        score += alphaish
+
+        candidates.append((i, score))
+
+    if not candidates:
+        return 0
+
+    # Best score wins; ties broken by lowest row index
+    candidates.sort(key=lambda x: (-x[1], x[0]))
+    return candidates[0][0]
+
+
 def generate_demo_data(n: int = 5000, seed: int = 42) -> pd.DataFrame:
     """Synthetic Fahrenheit water-quality time series with rainfall + stage.
 

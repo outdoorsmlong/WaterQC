@@ -56,27 +56,78 @@ except ImportError as e:
 # ---------------------------------------------------------------------------
 
 def read_csv_resilient(uploaded_file, label: str = "file") -> tuple[pd.DataFrame, str]:
-    """Read a CSV upload trying common encodings and delimiters.
+    """Read a CSV or Excel upload, handling common real-world quirks.
 
-    Excel-exported CSVs are often UTF-16 (with a BOM) or Windows-1252,
-    not UTF-8. Tab-separated exports also happen. This tries each
-    combination and returns the first that parses to >= 2 columns.
+    Quirks handled:
+      - Multiple encodings (UTF-8, UTF-8-BOM, UTF-16, CP1252, Latin-1)
+      - Multiple delimiters (comma, tab, semicolon)
+      - Header row not at line 0 (AQUARIUS exports, Campbell exports)
+      - Excel files (.xlsx) — read directly
 
-    Returns (dataframe, note) where `note` describes which encoding worked.
+    Returns (dataframe, note) describing what was detected so the user can see
+    in the alignment log.
     """
+    from water_quality_qc_v2 import detect_csv_header_row
+
+    # Detect Excel by extension or content
+    filename = getattr(uploaded_file, "name", "").lower()
+    is_excel = filename.endswith((".xlsx", ".xls", ".xlsm"))
+
+    if is_excel:
+        # Excel: try the common AQUARIUS side-by-side layout first
+        uploaded_file.seek(0)
+        # Read all sheets, use the first
+        xl = pd.ExcelFile(uploaded_file)
+        sheet = xl.sheet_names[0]
+        # AQUARIUS side-by-side: header is on row 2 (0-indexed)
+        # Try row 0, 1, 2 and pick the one yielding the most named cols
+        best_df, best_hdr = None, 0
+        best_score = -1
+        for hdr in (0, 1, 2):
+            try:
+                df_try = pd.read_excel(xl, sheet_name=sheet, header=hdr)
+                # Score: count columns whose name is a non-empty string and not "Unnamed: N"
+                score = sum(
+                    1 for c in df_try.columns
+                    if isinstance(c, str) and c and not c.startswith("Unnamed:")
+                )
+                if score > best_score:
+                    best_score = score
+                    best_df = df_try
+                    best_hdr = hdr
+            except Exception:
+                continue
+        if best_df is None or best_score < 2:
+            raise ValueError(f"Could not parse Excel {label}: no readable header found.")
+        note = f"format=Excel, sheet={sheet!r}, header_row={best_hdr}"
+        return best_df, note
+
+    # CSV path
     encodings = ["utf-8", "utf-8-sig", "utf-16", "cp1252", "latin-1"]
     separators = [",", "\t", ";"]
+
+    # Auto-detect the header row (skips comments, UUID rows, units rows)
+    try:
+        hdr_row = detect_csv_header_row(uploaded_file)
+    except Exception:
+        hdr_row = 0
 
     last_err = None
     for enc in encodings:
         for sep in separators:
             try:
                 uploaded_file.seek(0)
-                df = pd.read_csv(uploaded_file, encoding=enc, sep=sep)
+                df = pd.read_csv(
+                    uploaded_file,
+                    encoding=enc, sep=sep,
+                    skiprows=hdr_row if hdr_row > 0 else None,
+                )
                 if df.shape[1] >= 2:
                     note = f"encoding={enc}"
                     if sep != ",":
                         note += f", sep={'TAB' if sep == chr(9) else repr(sep)}"
+                    if hdr_row > 0:
+                        note += f", header_row={hdr_row}"
                     return df, note
             except (UnicodeDecodeError, UnicodeError) as e:
                 last_err = e
@@ -133,6 +184,8 @@ with st.sidebar:
     if source == "Try demo data":
         if st.button("Generate demo data", use_container_width=True):
             st.session_state.data = generate_demo_data()
+            st.session_state._resample_decided = False
+            st.session_state._resample_diag = None
             st.session_state.alignment_log = [
                 "Demo data: rainfall + stage already on the WQ grid (no alignment needed)."
             ]
@@ -141,21 +194,21 @@ with st.sidebar:
         st.markdown("**Water quality CSV** *(required)*")
         wq_file = st.file_uploader(
             "Timestamp + parameter columns",
-            type=["csv"], key="wq_upload",
+            type=["csv", "xlsx", "xls"], key="wq_upload",
             label_visibility="collapsed",
         )
 
         st.markdown("**Rainfall CSV** *(optional, separate file)*")
         rain_file = st.file_uploader(
             "Timestamp + rainfall column",
-            type=["csv"], key="rain_upload",
+            type=["csv", "xlsx", "xls"], key="rain_upload",
             label_visibility="collapsed",
         )
 
         st.markdown("**Stage CSV** *(optional, separate file)*")
         stage_file = st.file_uploader(
             "Timestamp + stage column",
-            type=["csv"], key="stage_upload",
+            type=["csv", "xlsx", "xls"], key="stage_upload",
             label_visibility="collapsed",
         )
 
@@ -251,6 +304,8 @@ with st.sidebar:
                             )
 
             st.session_state.data = merged
+            st.session_state._resample_decided = False
+            st.session_state._resample_diag = None
             st.session_state.alignment_log = log
             st.success(f"Loaded and aligned: {len(merged):,} rows × {len(merged.columns)} columns.")
 
@@ -284,6 +339,104 @@ if st.session_state.alignment_log:
 with st.expander("📋 Data preview", expanded=False):
     st.dataframe(data.head(20), use_container_width=True)
     st.caption(f"Shape: {data.shape[0]:,} rows × {data.shape[1]} columns")
+
+# ----- Cadence detection + optional auto-resample -------------------------
+
+from water_quality_qc_v2 import (
+    detect_column_cadences, needs_resampling, resample_to_grid,
+)
+
+# Detect timestamp column (first column that parses as datetimes)
+_probe_ts_col = None
+for _c in data.columns:
+    try:
+        _parsed = pd.to_datetime(data[_c].head(50), errors="raise")
+        if _parsed.notna().all():
+            _probe_ts_col = _c
+            break
+    except Exception:
+        continue
+
+if _probe_ts_col is not None:
+    _cadence_report = detect_column_cadences(data, _probe_ts_col)
+    _mixed = needs_resampling(_cadence_report)
+    if _mixed and not st.session_state.get("_resample_decided"):
+        st.warning(
+            "⚠️ **Mixed sampling cadences detected.** Some columns are at "
+            "different intervals (likely a Campbell-logger-style export). "
+            "If left unresampled, covariates on a different cadence than the "
+            "WQ sensor will appear mostly NaN and won't contribute to QC."
+        )
+        with st.expander("Cadence details", expanded=True):
+            st.dataframe(_cadence_report, use_container_width=True, hide_index=True)
+
+        # Default target = median of cadences (excluding outliers)
+        _valid_cads = _cadence_report.dropna(subset=["mode_interval_min"])
+        _default_target = (
+            float(_valid_cads["mode_interval_min"].median())
+            if len(_valid_cads) else 15.0
+        )
+
+        rcol1, rcol2, rcol3 = st.columns([2, 2, 1])
+        with rcol1:
+            _target_interval = st.number_input(
+                "Resample target interval (minutes)",
+                min_value=1.0, max_value=240.0,
+                value=_default_target, step=1.0,
+                help="All columns will be regridded to this cadence. Rainfall is summed; everything else uses nearest-neighbor.",
+            )
+        with rcol2:
+            # Guess rainfall column by name hint
+            _rain_guess = [
+                c for c in data.columns
+                if any(h in c.lower() for h in ("precip", "rain", "rg"))
+            ]
+            _rain_cols_sel = st.multiselect(
+                "Rainfall column(s) (will be SUMMED per bin)",
+                options=[c for c in data.columns if c != _probe_ts_col],
+                default=_rain_guess,
+            )
+        with rcol3:
+            st.write("")  # spacer for alignment
+            st.write("")
+            if st.button("🔄 Auto-resample", type="primary", use_container_width=True):
+                with st.spinner(f"Resampling to {_target_interval}-min grid..."):
+                    new_data, diag = resample_to_grid(
+                        data, _probe_ts_col,
+                        target_interval_minutes=_target_interval,
+                        rainfall_cols=_rain_cols_sel,
+                    )
+                st.session_state.data = new_data
+                st.session_state._resample_decided = True
+                st.session_state._resample_diag = {
+                    "target_interval": _target_interval,
+                    "n_rows_before": len(data),
+                    "n_rows_after": len(new_data),
+                    "rainfall_cols": _rain_cols_sel,
+                }
+                st.rerun()
+            if st.button("Keep as-is", use_container_width=True):
+                st.session_state._resample_decided = True
+                st.session_state._resample_diag = {
+                    "kept_mixed": True,
+                    "n_rows": len(data),
+                }
+                st.rerun()
+        st.stop()  # Don't proceed until user decides
+
+    elif st.session_state.get("_resample_diag"):
+        diag = st.session_state["_resample_diag"]
+        if diag.get("kept_mixed"):
+            st.info(
+                f"📊 **Mixed-cadence file kept as-is** ({diag['n_rows']:,} rows). "
+                "Some covariates may be NaN at WQ timestamps."
+            )
+        else:
+            st.success(
+                f"✅ **Resampled** from {diag['n_rows_before']:,} rows to "
+                f"{diag['n_rows_after']:,} rows on a {diag['target_interval']}-min grid. "
+                f"Rainfall cols summed: {diag.get('rainfall_cols') or 'none'}."
+            )
 
 # ===========================================================================
 # Tabs: Rules-based QC  |  LSTM Train  |  LSTM Detect & Validate
@@ -438,6 +591,21 @@ with tab_rules:
     # Convert "none" sentinel to None
     rainfall_col = None if rainfall_col == "— none —" else rainfall_col
     stage_col = None if stage_col == "— none —" else stage_col
+
+    # Warn if a selected covariate is mostly NaN at WQ timestamps
+    def _check_covariate_density(col_name, label):
+        if col_name and col_name in data.columns:
+            pct_valid = data[col_name].notna().mean() * 100
+            if pct_valid < 50:
+                st.warning(
+                    f"⚠️ **{label} column `{col_name}` is {100 - pct_valid:.0f}% empty** "
+                    f"at your WQ timestamps. The {label.lower()} feature won't "
+                    "contribute meaningfully to event suppression or correction. "
+                    "Consider running auto-resample (above) or uploading the "
+                    f"{label.lower()} data as a separate file."
+                )
+    _check_covariate_density(rainfall_col, "Rainfall")
+    _check_covariate_density(stage_col, "Stage")
 
     # ----- Parameter configs (collapsible) ------------------------------------
 
@@ -740,12 +908,19 @@ with tab_train:
         st.error(
             "**TensorFlow is not installed.** LSTM training and detection "
             "require it.\n\n"
-            "**To enable locally:**\n"
-            "```\npip install -r requirements-lstm.txt\n```\n\n"
-            "**Streamlit Cloud users:** TensorFlow needs Python 3.9–3.12, "
-            "not 3.13/3.14. Add a `.python-version` file containing `3.11` "
-            "to your repo root, then add `tensorflow>=2.15` and "
-            "`scikit-learn>=1.3` to `requirements.txt`.\n\n"
+            "**Recommended: train locally.** TensorFlow is heavy and Streamlit "
+            "Cloud's free tier may run out of memory during training. Install "
+            "locally with Python 3.11 or 3.12:\n"
+            "```\npip install -r requirements-lstm.txt\n```\n"
+            "Then commit your trained `models/` folder to the repo. The cloud "
+            "app can load the trained models for detection (but not train new ones).\n\n"
+            "**Or, deploy on Streamlit Cloud with TF (advanced):**\n"
+            "1. Delete the app in Streamlit Cloud and redeploy. In *Advanced "
+            "settings* at deploy time, select Python 3.11 or 3.12. The "
+            "`.python-version` and `runtime.txt` files are **ignored** — only the "
+            "deploy-time dropdown works.\n"
+            "2. Add `tensorflow>=2.15,<2.20` and `scikit-learn>=1.3` to "
+            "`requirements.txt` and push.\n\n"
             f"Detail: `{_LSTM_IMPORT_ERROR}`"
         )
     else:
@@ -761,7 +936,7 @@ with tab_train:
 
         clean_file = st.file_uploader(
             "Clean / corrected CSV",
-            type=["csv"], key="clean_upload_train",
+            type=["csv", "xlsx", "xls"], key="clean_upload_train",
         )
 
         if clean_file is not None:
