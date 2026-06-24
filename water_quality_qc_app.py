@@ -33,23 +33,47 @@ from preset_loader import (
     preset_to_session_state,
 )
 
-# LSTM is optional — only enable if both the module AND TensorFlow are present
+# ML backend selection: prefer LSTM (TensorFlow) if available, otherwise
+# fall back to sklearn-based learned models. Both expose the same API, so
+# the rest of the app uses a generic name (`ParameterModel`) and doesn't
+# care which one is active.
+_ML_BACKEND = None
+_ML_BACKEND_ERROR = ""
+
+# Try sklearn (learned_models) first — it's the lighter, more reliable path
 try:
-    from lstm_models import (
-        LSTMConfig, ParameterLSTM, derive_labels, compute_metrics,
+    from learned_models import (
+        LearnedConfig as ParameterConfig_ML,
+        ParameterLearned as ParameterModel,
+        derive_labels, compute_metrics,
         DEFAULT_LABEL_TOLERANCES,
     )
-    # The module imports without TF (lazy), so check TF directly
-    try:
-        import tensorflow as _tf_check  # noqa: F401
-        _LSTM_AVAILABLE = True
-        _LSTM_IMPORT_ERROR = ""
-    except ImportError as e:
-        _LSTM_AVAILABLE = False
-        _LSTM_IMPORT_ERROR = f"TensorFlow not installed ({e})"
+    _ML_BACKEND = "sklearn"
 except ImportError as e:
-    _LSTM_AVAILABLE = False
-    _LSTM_IMPORT_ERROR = str(e)
+    _ML_BACKEND_ERROR = f"scikit-learn missing: {e}"
+
+# If the user explicitly has TF + lstm_models, they can override by setting
+# this env var, but we don't try to load TF eagerly because that's slow.
+import os as _os
+if _os.environ.get("WQC_USE_LSTM", "").lower() in ("1", "true", "yes"):
+    try:
+        from lstm_models import (
+            LSTMConfig as ParameterConfig_ML,
+            ParameterLSTM as ParameterModel,
+            derive_labels, compute_metrics,
+            DEFAULT_LABEL_TOLERANCES,
+        )
+        import tensorflow as _tf_check  # noqa: F401
+        _ML_BACKEND = "tensorflow_lstm"
+    except ImportError as e:
+        # Fall through — sklearn import above (if successful) stays active
+        pass
+
+_ML_AVAILABLE = _ML_BACKEND is not None
+
+# Backward-compat aliases so the rest of the file doesn't need to change
+_LSTM_AVAILABLE = _ML_AVAILABLE
+_LSTM_IMPORT_ERROR = _ML_BACKEND_ERROR
 
 # ---------------------------------------------------------------------------
 # Robust CSV reading (handles Excel exports: UTF-16, Latin-1, tabs, etc.)
@@ -444,8 +468,8 @@ if _probe_ts_col is not None:
 
 tab_rules, tab_train, tab_lstm = st.tabs([
     "🔧 Rules-based QC",
-    "🧠 Train LSTM",
-    "🔬 LSTM Detect & Validate",
+    "🧠 Train Model",
+    "🔬 Detect & Validate",
 ])
 
 with tab_rules:
@@ -929,34 +953,44 @@ with tab_rules:
 # ===========================================================================
 
 with tab_train:
-    st.subheader("Train an LSTM per parameter (PyHydroQC-style)")
+    _backend_label = {
+        "sklearn": "🌳 Gradient Boosting",
+        "tensorflow_lstm": "🧠 LSTM",
+    }.get(_ML_BACKEND, "ML")
+    st.subheader(f"Train a {_backend_label} model per parameter (PyHydroQC-style)")
 
-    if not _LSTM_AVAILABLE:
+    if not _ML_AVAILABLE:
         st.error(
-            "**TensorFlow is not installed.** LSTM training and detection "
-            "require it.\n\n"
-            "**Recommended: train locally.** TensorFlow is heavy and Streamlit "
-            "Cloud's free tier may run out of memory during training. Install "
-            "locally with Python 3.11 or 3.12:\n"
-            "```\npip install -r requirements-lstm.txt\n```\n"
-            "Then commit your trained `models/` folder to the repo. The cloud "
-            "app can load the trained models for detection (but not train new ones).\n\n"
-            "**Or, deploy on Streamlit Cloud with TF (advanced):**\n"
-            "1. Delete the app in Streamlit Cloud and redeploy. In *Advanced "
-            "settings* at deploy time, select Python 3.11 or 3.12. The "
-            "`.python-version` and `runtime.txt` files are **ignored** — only the "
-            "deploy-time dropdown works.\n"
-            "2. Add `tensorflow>=2.15,<2.20` and `scikit-learn>=1.3` to "
-            "`requirements.txt` and push.\n\n"
-            f"Detail: `{_LSTM_IMPORT_ERROR}`"
+            "**No ML backend installed.** The Train tab needs either "
+            "**scikit-learn** (recommended, light) or **TensorFlow** (heavier, "
+            "more powerful).\n\n"
+            "**Easiest fix — install scikit-learn:**\n"
+            "```\npip install scikit-learn\n```\n"
+            "This works on any Python 3.9+ and runs fast on CPU.\n\n"
+            "**Alternative — TensorFlow LSTM (heavier):**\n"
+            "```\npip install -r requirements-lstm.txt\nexport WQC_USE_LSTM=1\n```\n"
+            "Needs Python 3.10–3.12. On Streamlit Cloud, pick Python 3.11 "
+            "in Advanced settings at deploy time.\n\n"
+            f"Detail: `{_ML_BACKEND_ERROR}`"
         )
     else:
-        st.caption(
-            "Train a **forecast** model (predicts next clean value from past + "
-            "covariates → residuals flag anomalies) and a **correction** model "
-            "(maps raw windows to clean values → fills flagged gaps). "
-            "Trained models are saved to disk and can be reused without retraining."
-        )
+        if _ML_BACKEND == "sklearn":
+            st.caption(
+                "Using **scikit-learn HistGradientBoosting** — fast (seconds), "
+                "lightweight, installs anywhere. Trains a **forecast** model "
+                "(predicts next clean value from past + covariates → residuals "
+                "flag anomalies) and a **correction** model (maps raw windows "
+                "to clean values → fills flagged gaps). Saved models reuse "
+                "without retraining."
+            )
+        else:
+            st.caption(
+                "Using **TensorFlow LSTM**. Trains a **forecast** model "
+                "(predicts next clean value from past + covariates → residuals "
+                "flag anomalies) and a **correction** model (maps raw windows "
+                "to clean values → fills flagged gaps). Saved models reuse "
+                "without retraining."
+            )
 
         st.markdown("**Step 1.** Upload your *clean* (corrected) dataset. "
                     "Timestamps must match the raw data already loaded above.")
@@ -1058,7 +1092,7 @@ with tab_train:
                         raw_series = data[p].reset_index(drop=True)
                         tol = DEFAULT_LABEL_TOLERANCES.get(p, 0.0)
 
-                        cfg = LSTMConfig(
+                        cfg = ParameterConfig_ML(
                             parameter=p,
                             window_size=int(window_size),
                             lstm_units=int(units),
@@ -1079,7 +1113,7 @@ with tab_train:
                             )
 
                         status.info(f"Training {p}...")
-                        lstm = ParameterLSTM(cfg)
+                        lstm = ParameterModel(cfg)
                         lstm.fit(
                             clean=clean_series, raw=raw_series,
                             covariates=covar_df,
@@ -1100,7 +1134,7 @@ with tab_train:
                     # Show loss curves
                     st.markdown("#### Training loss curves")
                     for p, path in trained.items():
-                        lstm = ParameterLSTM.load(path)
+                        lstm = ParameterModel.load(path)
                         fig, ax = plt.subplots(figsize=(10, 2.5))
                         hist = lstm.history.get("forecast")
                         if hist:
@@ -1132,15 +1166,19 @@ with tab_train:
 # ===========================================================================
 
 with tab_lstm:
-    st.subheader("Run a trained LSTM on the raw data")
+    _backend_label2 = {
+        "sklearn": "Gradient Boosting",
+        "tensorflow_lstm": "LSTM",
+    }.get(_ML_BACKEND, "trained")
+    st.subheader(f"Run a trained {_backend_label2} model on the raw data")
 
-    if not _LSTM_AVAILABLE:
-        st.error("TensorFlow not installed — see the Train tab for instructions.")
+    if not _ML_AVAILABLE:
+        st.error("No ML backend installed — see the Train tab for setup options.")
     else:
         st.caption(
-            "Apply trained LSTM models to flag anomalies and (optionally) correct "
-            "flagged points. If you also have clean reference data loaded in the "
-            "Train tab, you'll see precision / recall / F1 metrics."
+            f"Apply trained {_backend_label2} models to flag anomalies and "
+            "(optionally) correct flagged points. If you also have clean reference "
+            "data loaded in the Train tab, you'll see precision / recall / F1 metrics."
         )
 
         model_root = st.text_input(
@@ -1187,7 +1225,7 @@ with tab_lstm:
                 metrics_table = []
 
                 for p in run_params:
-                    lstm = ParameterLSTM.load(Path(model_root) / p)
+                    lstm = ParameterModel.load(Path(model_root) / p)
                     raw_series = data[p].reset_index(drop=True)
 
                     flags, residual, threshold = lstm.detect_anomalies(
