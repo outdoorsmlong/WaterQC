@@ -595,8 +595,13 @@ def align_to_grid(
     full = full.sort_values(target_ts_col).reset_index(drop=True)
     for vc in value_cols:
         col = pd.Series(np.nan, index=full.index, dtype="float64")
-        # Map valid rows by their original index
-        col.iloc[merged_valid["_orig_idx"].values] = merged_valid[vc].values
+        # Coerce incoming values to numeric — Pandas 2.2+ refuses to silently
+        # cast strings/mixed types into a float64 Series. This handles columns
+        # the user uploaded as quoted numbers, with blanks, or with stray text.
+        values_numeric = pd.to_numeric(
+            merged_valid[vc], errors="coerce"
+        ).to_numpy()
+        col.iloc[merged_valid["_orig_idx"].values] = values_numeric
         full[vc] = col.values
 
     # Diagnostics
