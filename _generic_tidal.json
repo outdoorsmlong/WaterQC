@@ -1,17 +1,17 @@
 {
-  "station_id": "GENERIC_TIDAL",
-  "station_name": "Generic tidal/estuarine site (template)",
-  "description": "Settings for brackish/estuarine sites where specific conductivity is much higher than freshwater and varies with tidal cycles. Adjust ranges based on your specific salinity regime.",
+  "station_id": "GENERIC_MOUNTAIN",
+  "station_name": "Generic cold-water mountain stream (template)",
+  "description": "Settings for cold, oligotrophic mountain streams with stable low conductivity and high dissolved oxygen. Lower temperature ceiling and tighter SpC/pH ranges.",
   "sampling_interval_minutes": 15,
   "column_aliases": {
-    "timestamp": ["datetime", "TimeStamp", "Timestamp", "time"],
-    "pH": ["pH", "ph", "PH"],
+    "timestamp": ["datetime", "TimeStamp", "time"],
+    "pH": ["pH", "ph"],
     "temperature": ["temperature", "Water Temp", "Temp"],
-    "turbidity": ["turbidity", "Turb", "Turbidity"],
-    "specific_conductivity": ["specific_conductivity", "Spec Cond", "SpC", "Salinity"],
+    "turbidity": ["turbidity", "Turb"],
+    "specific_conductivity": ["specific_conductivity", "Spec Cond", "SpC"],
     "dissolved_oxygen": ["dissolved_oxygen", "DO", "O2"],
-    "stage": ["Stage", "TideHeight", "WaterLevel"],
-    "rainfall": ["rainfall", "Precip", "Rain"]
+    "stage": ["Stage", "WaterLevel"],
+    "rainfall": ["rainfall", "Precip"]
   },
   "covariates": {
     "rainfall_col_hint": "rainfall",
@@ -24,7 +24,7 @@
     "temperature": {
       "units": "°F",
       "range_min": 32,
-      "range_max": 95,
+      "range_max": 75,
       "spike_threshold": 4.0,
       "persistence_window": 12,
       "max_rate_change": 6.0,
@@ -34,25 +34,24 @@
       "use_covariates_for_correction": false
     },
     "specific_conductivity": {
-      "units": "mS/cm",
-      "range_min": 0.1,
-      "range_max": 60,
+      "units": "µS/cm",
+      "range_min": 0,
+      "range_max": 500,
       "spike_threshold": 4.0,
-      "persistence_window": 12,
-      "max_rate_change": 10,
+      "persistence_window": 24,
+      "max_rate_change": 50,
       "suppress_spike_in_rain": false,
       "suppress_rate_in_rain": true,
       "suppress_range_min_in_high_stage": false,
-      "use_covariates_for_correction": true,
-      "notes": "Range covers freshwater (~0.5) through seawater (~50). Tidal cycles can swing SpC by 10s of mS/cm per hour — max rate is generous."
+      "use_covariates_for_correction": true
     },
     "pH": {
       "units": "pH",
-      "range_min": 6.5,
-      "range_max": 9.0,
+      "range_min": 5.5,
+      "range_max": 8.5,
       "spike_threshold": 3.5,
       "persistence_window": 12,
-      "max_rate_change": 0.8,
+      "max_rate_change": 0.5,
       "suppress_spike_in_rain": false,
       "suppress_rate_in_rain": true,
       "suppress_range_min_in_high_stage": false,
@@ -60,24 +59,24 @@
     },
     "dissolved_oxygen": {
       "units": "mg/L",
-      "range_min": 0,
+      "range_min": 5,
       "range_max": 16,
       "spike_threshold": 4.0,
       "persistence_window": 12,
-      "max_rate_change": 5.0,
+      "max_rate_change": 4.0,
       "suppress_spike_in_rain": false,
       "suppress_rate_in_rain": true,
-      "suppress_range_min_in_high_stage": true,
+      "suppress_range_min_in_high_stage": false,
       "use_covariates_for_correction": true,
-      "notes": "Estuarine systems often have real hypoxia events; suppress low-DO flags during high stage."
+      "notes": "Cold mountain streams should rarely drop below 5 mg/L."
     },
     "turbidity": {
       "units": "NTU",
       "range_min": 0,
-      "range_max": 1500,
-      "spike_threshold": 5.5,
+      "range_max": 500,
+      "spike_threshold": 5.0,
       "persistence_window": 12,
-      "max_rate_change": 100,
+      "max_rate_change": 30,
       "suppress_spike_in_rain": true,
       "suppress_rate_in_rain": true,
       "suppress_range_min_in_high_stage": false,
@@ -85,16 +84,15 @@
     },
     "stage": {
       "units": "ft",
-      "range_min": -2,
-      "range_max": 15,
+      "range_min": 0,
+      "range_max": 20,
       "spike_threshold": 4.0,
       "persistence_window": 12,
-      "max_rate_change": 3.0,
+      "max_rate_change": 2.0,
       "suppress_spike_in_rain": false,
       "suppress_rate_in_rain": false,
       "suppress_range_min_in_high_stage": false,
-      "use_covariates_for_correction": false,
-      "notes": "Negative stage minimum allows for low-tide values below local datum."
+      "use_covariates_for_correction": false
     }
   },
   "version": "1.0",

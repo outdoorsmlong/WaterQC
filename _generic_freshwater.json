@@ -1,21 +1,21 @@
 {
-  "station_id": "GENERIC_FRESHWATER",
-  "station_name": "Generic freshwater stream (default)",
-  "description": "Conservative defaults for a typical surface freshwater monitoring site (15-min sampling). Use as a starting point for new stations, then tune after seeing 1-2 weeks of data.",
+  "station_id": "GENERIC_CAMPBELL",
+  "station_name": "Generic Campbell PakBus logger export (template)",
+  "description": "Template for any Campbell-Scientific PakBus logger CSV export. Recognizes the typical 3-row header (Id / Names / Units) and the mixed-cadence layout where pressure transducer (PT) and rain gauge are at faster intervals than the sonde. The app will offer to auto-resample on load.",
   "sampling_interval_minutes": 15,
   "column_aliases": {
-    "timestamp": ["datetime", "TimeStamp", "Timestamp", "time", "DATE", "DateTime"],
-    "pH": ["pH", "ph", "PH"],
-    "temperature": ["temperature", "Water Temp", "Temp", "Temperature"],
-    "turbidity": ["turbidity", "Turb", "Turbidity", "NTU", "FNU"],
-    "specific_conductivity": ["specific_conductivity", "Spec Cond", "SpC", "SPC", "Conductivity"],
-    "dissolved_oxygen": ["dissolved_oxygen", "DO", "O2", "O2 mg/L"],
-    "stage": ["Stage", "WaterLevel", "stage_ft"],
-    "rainfall": ["rainfall", "Precip", "Rain", "Precipitation"]
+    "timestamp": ["Timestamp", "TIMESTAMP", "ts"],
+    "pH": ["Sonde - Sonde pH SU", "Sonde pH SU", "pH"],
+    "temperature": ["Sonde - Sonde Temp F", "Sonde Temp F", "Temp"],
+    "turbidity": ["Sonde - Sonde Turb NTU", "Sonde Turb NTU", "Turb"],
+    "specific_conductivity": ["Sonde - Sonde SpCond mScm", "Sonde SpCond mScm", "SpC"],
+    "dissolved_oxygen": ["Sonde - Sonde DO mgL", "Sonde DO mgL", "DO"],
+    "stage": ["PT - PT Depth ft", "PT Depth ft", "Stage"],
+    "rainfall": ["Rain Gauge - RG PrecipInc in", "RG PrecipInc in", "Precip"]
   },
   "covariates": {
-    "rainfall_col_hint": "rainfall",
-    "stage_col_hint": "stage",
+    "rainfall_col_hint": "Rain Gauge - RG PrecipInc in",
+    "stage_col_hint": "PT - PT Depth ft",
     "rain_window_hr": 1.0,
     "rain_event_threshold": 0.05,
     "stage_high_quantile": 0.90
@@ -34,21 +34,22 @@
       "use_covariates_for_correction": false
     },
     "specific_conductivity": {
-      "units": "µS/cm",
-      "range_min": 0,
-      "range_max": 2000,
+      "units": "mS/cm",
+      "range_min": 0.0,
+      "range_max": 2.0,
       "spike_threshold": 4.0,
-      "persistence_window": 12,
-      "max_rate_change": 200,
+      "persistence_window": 24,
+      "max_rate_change": 0.5,
       "suppress_spike_in_rain": false,
       "suppress_rate_in_rain": true,
       "suppress_range_min_in_high_stage": false,
-      "use_covariates_for_correction": true
+      "use_covariates_for_correction": true,
+      "notes": "Range_max 2.0 mS/cm accommodates both fresh and slightly brackish sites. Tighten for known-freshwater stations."
     },
     "pH": {
       "units": "pH",
-      "range_min": 4,
-      "range_max": 10,
+      "range_min": 5.0,
+      "range_max": 9.5,
       "spike_threshold": 3.5,
       "persistence_window": 12,
       "max_rate_change": 1.0,
@@ -59,11 +60,11 @@
     },
     "dissolved_oxygen": {
       "units": "mg/L",
-      "range_min": 0,
-      "range_max": 20,
+      "range_min": 0.0,
+      "range_max": 18.0,
       "spike_threshold": 4.0,
       "persistence_window": 12,
-      "max_rate_change": 6.0,
+      "max_rate_change": 5.0,
       "suppress_spike_in_rain": false,
       "suppress_rate_in_rain": true,
       "suppress_range_min_in_high_stage": true,
@@ -71,20 +72,21 @@
     },
     "turbidity": {
       "units": "NTU",
-      "range_min": 0,
-      "range_max": 1000,
-      "spike_threshold": 5.0,
+      "range_min": -15,
+      "range_max": 1500,
+      "spike_threshold": 5.5,
       "persistence_window": 12,
-      "max_rate_change": 50,
+      "max_rate_change": 200,
       "suppress_spike_in_rain": true,
       "suppress_rate_in_rain": true,
       "suppress_range_min_in_high_stage": false,
-      "use_covariates_for_correction": true
+      "use_covariates_for_correction": true,
+      "notes": "Range_min -15 allows YSI/Hydrolab sonde fouling artifacts that techs often retain."
     },
     "stage": {
       "units": "ft",
       "range_min": 0,
-      "range_max": 30,
+      "range_max": 20,
       "spike_threshold": 4.0,
       "persistence_window": 12,
       "max_rate_change": 2.0,
@@ -93,6 +95,14 @@
       "suppress_range_min_in_high_stage": false,
       "use_covariates_for_correction": false
     }
+  },
+  "data_quality_notes": {
+    "logger_sentinel": "NaN (Campbell loggers typically leave missing fields blank rather than using -99999)",
+    "typical_cadences": {
+      "PT_and_rain": "5 minutes",
+      "sonde": "15 minutes"
+    },
+    "header_layout": "3 rows: Id (UUIDs) / Names (parameter paths) / Units"
   },
   "version": "1.0",
   "last_updated": "2026-05-14"

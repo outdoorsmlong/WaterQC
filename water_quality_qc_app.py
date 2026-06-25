@@ -1044,14 +1044,34 @@ with tab_train:
                         help="96 samples = 24 hours at 15-min sampling",
                     )
                 with t2:
-                    epochs = st.number_input(
-                        "Epochs", min_value=5, max_value=500, value=50, step=5,
+                    if _ML_BACKEND == "sklearn":
+                        iterations_label = "Max iterations"
+                        iterations_default = 200
+                        iterations_help = ("Gradient-boosting iterations. Training "
+                                           "auto-stops earlier if validation loss plateaus.")
+                    else:
+                        iterations_label = "Epochs"
+                        iterations_default = 50
+                        iterations_help = "Number of training passes over the data."
+                    iterations = st.number_input(
+                        iterations_label,
+                        min_value=5, max_value=500,
+                        value=iterations_default, step=5,
+                        help=iterations_help,
                     )
                 with t3:
-                    units = st.number_input(
-                        "LSTM units / layer",
-                        min_value=8, max_value=256, value=64, step=8,
-                    )
+                    if _ML_BACKEND == "sklearn":
+                        # Tree depth controls model capacity for gradient boosting
+                        capacity = st.number_input(
+                            "Tree max depth",
+                            min_value=2, max_value=12, value=6, step=1,
+                            help="Controls model capacity. 6 is a good default.",
+                        )
+                    else:
+                        capacity = st.number_input(
+                            "LSTM units / layer",
+                            min_value=8, max_value=256, value=64, step=8,
+                        )
                 with t4:
                     threshold_k = st.number_input(
                         "Anomaly threshold k (mean+k*std)",
@@ -1059,7 +1079,7 @@ with tab_train:
                     )
 
                 use_covars_in_lstm = st.checkbox(
-                    "Include rainfall + stage as LSTM features",
+                    "Include rainfall + stage as features",
                     value=(rainfall_col is not None or stage_col is not None),
                     disabled=(rainfall_col is None and stage_col is None),
                 )
@@ -1070,7 +1090,7 @@ with tab_train:
                     help="One subfolder per parameter will be created here.",
                 )
 
-                if st.button("🚂 Train LSTMs", type="primary",
+                if st.button("🚂 Train models", type="primary",
                              use_container_width=True):
                     if not params_to_train:
                         st.error("Pick at least one parameter.")
@@ -1092,14 +1112,26 @@ with tab_train:
                         raw_series = data[p].reset_index(drop=True)
                         tol = DEFAULT_LABEL_TOLERANCES.get(p, 0.0)
 
-                        cfg = ParameterConfig_ML(
+                        # Build a config using only fields the active backend supports.
+                        # Both LearnedConfig and LSTMConfig share these core fields:
+                        common_kwargs = dict(
                             parameter=p,
                             window_size=int(window_size),
-                            lstm_units=int(units),
-                            epochs=int(epochs),
                             threshold_k=float(threshold_k),
                             label_tolerance=float(tol),
                         )
+                        if _ML_BACKEND == "sklearn":
+                            cfg = ParameterConfig_ML(
+                                max_iter=int(iterations),
+                                max_depth=int(capacity),
+                                **common_kwargs,
+                            )
+                        else:
+                            cfg = ParameterConfig_ML(
+                                epochs=int(iterations),
+                                lstm_units=int(capacity),
+                                **common_kwargs,
+                            )
 
                         def cb(phase, ep, total, logs):
                             overall = (
@@ -1132,7 +1164,9 @@ with tab_train:
                     st.session_state.lstm_clean_df = clean_df
 
                     # Show loss curves
-                    st.markdown("#### Training loss curves")
+                    st.markdown("#### Training history")
+                    _x_label = "iteration" if _ML_BACKEND == "sklearn" else "epoch"
+                    _y_label = "score" if _ML_BACKEND == "sklearn" else "MSE loss"
                     for p, path in trained.items():
                         lstm = ParameterModel.load(path)
                         fig, ax = plt.subplots(figsize=(10, 2.5))
@@ -1150,8 +1184,8 @@ with tab_train:
                                 ax.plot(hist_c["val_loss"], label="correction val",
                                         lw=1, ls="--", color="darkgreen")
                         ax.set_title(f"{p} — training history")
-                        ax.set_xlabel("epoch")
-                        ax.set_ylabel("MSE loss")
+                        ax.set_xlabel(_x_label)
+                        ax.set_ylabel(_y_label)
                         ax.legend(fontsize=8)
                         ax.grid(alpha=0.3)
                         st.pyplot(fig)
