@@ -1012,7 +1012,39 @@ with tab_train:
                 if clean_ts is None:
                     st.error("Couldn't auto-detect a timestamp column in the clean file.")
                     st.stop()
-                clean_df[clean_ts] = pd.to_datetime(clean_df[clean_ts])
+                clean_df[clean_ts] = pd.to_datetime(clean_df[clean_ts], errors="coerce")
+                # Drop rows where the timestamp couldn't be parsed
+                clean_df = clean_df.dropna(subset=[clean_ts])
+                # Drop any other columns that look like timestamps — common in
+                # AQUARIUS side-by-side Excel exports where each parameter has
+                # its own timestamp column. Leaving them in confuses training.
+                _ts_like_cols = []
+                for c in list(clean_df.columns):
+                    if c == clean_ts:
+                        continue
+                    sample = clean_df[c].dropna().head(20)
+                    if sample.empty:
+                        continue
+                    # Only string-typed columns can be misinterpreted as
+                    # timestamps. Numeric columns might accidentally parse as
+                    # epoch dates and we don't want to drop those.
+                    if not pd.api.types.is_object_dtype(sample) and \
+                       not pd.api.types.is_string_dtype(sample):
+                        continue
+                    try:
+                        parsed = pd.to_datetime(sample, errors="raise")
+                        if parsed.notna().all():
+                            _ts_like_cols.append(c)
+                    except (ValueError, TypeError):
+                        pass
+                if _ts_like_cols:
+                    clean_df = clean_df.drop(columns=_ts_like_cols)
+                    st.caption(
+                        f"ℹ️ Dropped {len(_ts_like_cols)} extra timestamp-like "
+                        f"column(s) from the clean file: "
+                        f"{', '.join(repr(c) for c in _ts_like_cols)}"
+                    )
+
                 # Align clean to raw timestamps (should be identical, but in case)
                 clean_df = clean_df.set_index(clean_ts).reindex(
                     pd.to_datetime(data[ts_col]).values, method="nearest"
@@ -1023,6 +1055,15 @@ with tab_train:
                     c for c in param_cols
                     if c in clean_df.columns and c in data.columns
                 ]
+                with st.expander("ℹ️ Clean dataset diagnostics", expanded=False):
+                    st.write(
+                        f"- Clean file columns after parsing: "
+                        f"`{', '.join(clean_df.columns[:20])}`"
+                        + (f" ... ({len(clean_df.columns)} total)"
+                           if len(clean_df.columns) > 20 else "")
+                    )
+                    st.write(f"- Raw parameter columns (from rules tab): `{param_cols}`")
+                    st.write(f"- **Trainable** (intersection): `{trainable}`")
                 if not trainable:
                     st.warning(
                         "No matching parameter columns between raw and clean data. "
@@ -1096,10 +1137,17 @@ with tab_train:
                         st.error("Pick at least one parameter.")
                         st.stop()
 
-                    # Build covariate frame
+                    # Build covariate frame, ensuring everything is numeric
                     if use_covars_in_lstm:
                         cov_cols = [c for c in [rainfall_col, stage_col] if c is not None]
-                        covar_df = data[cov_cols].copy() if cov_cols else None
+                        if cov_cols:
+                            covar_df = data[cov_cols].copy()
+                            for c in cov_cols:
+                                covar_df[c] = pd.to_numeric(
+                                    covar_df[c], errors="coerce"
+                                )
+                        else:
+                            covar_df = None
                     else:
                         covar_df = None
 
@@ -1107,9 +1155,24 @@ with tab_train:
                     status = st.empty()
 
                     trained = {}
+                    skipped = []
                     for i, p in enumerate(params_to_train):
-                        clean_series = clean_df[p].reset_index(drop=True)
-                        raw_series = data[p].reset_index(drop=True)
+                        # Coerce both raw and clean series to numeric. Strings
+                        # that don't parse (timestamps, blanks, "NA") become NaN.
+                        clean_series = pd.to_numeric(
+                            clean_df[p].reset_index(drop=True), errors="coerce"
+                        )
+                        raw_series = pd.to_numeric(
+                            data[p].reset_index(drop=True), errors="coerce"
+                        )
+                        if clean_series.notna().sum() < 100 or raw_series.notna().sum() < 100:
+                            skipped.append(
+                                f"`{p}`: too few numeric values "
+                                f"(clean={int(clean_series.notna().sum())}, "
+                                f"raw={int(raw_series.notna().sum())}). "
+                                "Likely a non-numeric column was selected."
+                            )
+                            continue
                         tol = DEFAULT_LABEL_TOLERANCES.get(p, 0.0)
 
                         # Build a config using only fields the active backend supports.
@@ -1160,6 +1223,11 @@ with tab_train:
                         f"✅ Trained {len(trained)} model(s). "
                         f"Saved to `{model_dir}`."
                     )
+                    if skipped:
+                        st.warning(
+                            "⚠️ Some parameters were skipped:\n\n- "
+                            + "\n- ".join(skipped)
+                        )
                     st.session_state.trained_models = trained
                     st.session_state.lstm_clean_df = clean_df
 
