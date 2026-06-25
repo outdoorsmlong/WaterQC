@@ -1,0 +1,119 @@
+{
+  "station_id": "SMIB",
+  "station_name": "SMI_B — Smith Branch (Columbia, SC)",
+  "description": "Derived from a full year (2021) of raw + technician-corrected data — 32,613 sonde records (93% completeness). Urban stream with strong diurnal cycles, occasional storm-driven turbidity spikes (>500 NTU), and one major sensor failure period in July-August 2021. pH and DO sensors are well-behaved; SpC and turbidity show periodic fouling. Note: this station's logger uses NaN (not -99999) for missing data.",
+  "sampling_interval_minutes": 15,
+  "column_aliases": {
+    "timestamp": ["Timestamp (UTC-05:00)", "Timestamp", "TimeStamp", "ts", "datetime", "time"],
+    "pH": ["pH", "Sonde pH SU", "Sonde - Sonde pH SU"],
+    "temperature": ["Temp", "Water Temp", "Temperature", "Sonde Temp F", "Sonde - Sonde Temp F"],
+    "turbidity": ["Turb", "Turbidity", "Sonde Turb NTU", "Sonde - Sonde Turb NTU"],
+    "specific_conductivity": ["SpC", "SpCond", "Spec Cond", "Sonde SpCond mScm", "Sonde - Sonde SpCond mScm"],
+    "dissolved_oxygen": ["DO", "O2", "O2 mg/L", "Sonde DO mgL", "Sonde - Sonde DO mgL"],
+    "stage": ["Stage", "PT Depth ft", "PT - PT Depth ft"],
+    "rainfall": ["Precip", "Rainfall", "RG PrecipInc in", "Rain Gauge - RG PrecipInc in"]
+  },
+  "covariates": {
+    "rainfall_col_hint": "Rain Gauge - RG PrecipInc in",
+    "stage_col_hint": "PT - PT Depth ft",
+    "rain_window_hr": 1.0,
+    "rain_event_threshold": 0.05,
+    "stage_high_quantile": 0.90
+  },
+  "parameters": {
+    "temperature": {
+      "units": "°F",
+      "range_min": 32,
+      "range_max": 90,
+      "spike_threshold": 5.0,
+      "persistence_window": 12,
+      "max_rate_change": 8.0,
+      "suppress_spike_in_rain": false,
+      "suppress_rate_in_rain": false,
+      "suppress_range_min_in_high_stage": false,
+      "use_covariates_for_correction": false,
+      "notes": "Observed 42-86°F over the year. Range_min=32 (freezing) is a safety floor."
+    },
+    "specific_conductivity": {
+      "units": "mS/cm",
+      "range_min": 0.0,
+      "range_max": 0.5,
+      "spike_threshold": 4.5,
+      "persistence_window": 48,
+      "max_rate_change": 0.2,
+      "suppress_spike_in_rain": false,
+      "suppress_rate_in_rain": true,
+      "suppress_range_min_in_high_stage": false,
+      "use_covariates_for_correction": true,
+      "notes": "Stable urban baseline ~0.1 mS/cm. Persistence 48 (12 hr) is fine here — flatlines are much shorter than KINA's. Range_max 0.5 will catch the major fault events where sensor jumps to 100+ mS/cm."
+    },
+    "pH": {
+      "units": "pH",
+      "range_min": 5.5,
+      "range_max": 9.0,
+      "spike_threshold": 4.0,
+      "persistence_window": 12,
+      "max_rate_change": 1.2,
+      "suppress_spike_in_rain": false,
+      "suppress_rate_in_rain": true,
+      "suppress_range_min_in_high_stage": false,
+      "use_covariates_for_correction": true,
+      "notes": "Observed range 5.94-8.63 in corrected data. Range_min 5.5 catches out-of-range raw values like 4.09. The technician rejected ~3,400 raw outliers."
+    },
+    "dissolved_oxygen": {
+      "units": "mg/L",
+      "range_min": 0.5,
+      "range_max": 16.0,
+      "spike_threshold": 5.0,
+      "persistence_window": 12,
+      "max_rate_change": 4.0,
+      "suppress_spike_in_rain": false,
+      "suppress_rate_in_rain": true,
+      "suppress_range_min_in_high_stage": true,
+      "use_covariates_for_correction": true,
+      "notes": "DO well-behaved here (only 0.3% corrected). Range_max 16 leaves room for supersaturation; the lone 18.58 spike was likely a glitch and would be flagged."
+    },
+    "turbidity": {
+      "units": "NTU",
+      "range_min": -15,
+      "range_max": 1500,
+      "spike_threshold": 6.0,
+      "persistence_window": 12,
+      "max_rate_change": 500,
+      "suppress_spike_in_rain": true,
+      "suppress_rate_in_rain": true,
+      "suppress_range_min_in_high_stage": false,
+      "use_covariates_for_correction": true,
+      "notes": "Allow negative values down to -15 (sonde fouling artifact technician left in). High max_rate (500) because real storm pulses hit 230 NTU per 15-min step. Range_max 1500 catches the worst fault spikes."
+    },
+    "stage": {
+      "units": "ft",
+      "range_min": 0,
+      "range_max": 20,
+      "spike_threshold": 4.0,
+      "persistence_window": 12,
+      "max_rate_change": 3.0,
+      "suppress_spike_in_rain": false,
+      "suppress_rate_in_rain": false,
+      "suppress_range_min_in_high_stage": false,
+      "use_covariates_for_correction": false,
+      "notes": "Stage column may be entirely null in some exports of this station — verify before relying on it as a covariate."
+    }
+  },
+  "data_quality_notes": {
+    "annual_completeness_pct": 93.1,
+    "longest_outage_hours": 193,
+    "n_outages_over_30min": 14,
+    "fraction_corrected": {
+      "temperature": 0.187,
+      "pH": 0.012,
+      "turbidity": 0.404,
+      "specific_conductivity": 0.312,
+      "dissolved_oxygen": 0.003
+    },
+    "logger_sentinel": "NaN (not -99999). No numeric sentinel filtering needed at this station."
+  },
+  "source": "Derived from COLA_SMIB_2021_CORRECTED.xlsx + Campbell PakBus Logger export for calendar year 2021",
+  "version": "1.0",
+  "last_updated": "2026-05-14"
+}
