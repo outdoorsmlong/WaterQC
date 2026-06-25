@@ -182,7 +182,10 @@ class WaterQualityQCv2:
         self.high_stage = pd.Series(False, index=self.data.index)
 
         if self.rainfall_col and self.rainfall_col in self.data.columns:
-            rain = self.data[self.rainfall_col].fillna(0)
+            # Defensive numeric coercion — see note in run_parameter()
+            rain = pd.to_numeric(
+                self.data[self.rainfall_col], errors="coerce"
+            ).fillna(0)
             # Detect sample frequency to size the rolling window
             dt = self.data[self.timestamp_col].diff().median()
             if pd.isna(dt) or dt.total_seconds() == 0:
@@ -197,10 +200,11 @@ class WaterQualityQCv2:
             self.data["_rain_rolling"] = rolling
 
         if self.stage_col and self.stage_col in self.data.columns:
-            stage = self.data[self.stage_col]
+            stage = pd.to_numeric(self.data[self.stage_col], errors="coerce")
             cutoff = stage.quantile(self.stage_high_quantile)
-            self.high_stage = stage >= cutoff
-            self.data["_stage_cutoff"] = cutoff
+            if pd.notna(cutoff):
+                self.high_stage = stage >= cutoff
+                self.data["_stage_cutoff"] = cutoff
 
     # ---- Detection methods ------------------------------------------------
 
@@ -253,7 +257,11 @@ class WaterQualityQCv2:
 
     def run_parameter(self, parameter: str) -> pd.DataFrame:
         cfg = self.configs[parameter]
-        series = self.data[parameter]
+        # Defensively coerce to numeric — the user may have mapped a column
+        # that came in as strings (e.g. CSV cell with stray text, an empty
+        # column, or PyArrow-string-typed values from pandas 2.x). All five
+        # detectors below assume a numeric series.
+        series = pd.to_numeric(self.data[parameter], errors="coerce")
 
         flags = pd.DataFrame({
             "range": self._flag_range(series, cfg),
