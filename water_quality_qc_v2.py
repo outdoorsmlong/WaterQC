@@ -1,502 +1,922 @@
 """
-Water Quality QC Framework v2
-==============================
-Automated quality control for aquatic sensor data.
+Water Quality QC - Streamlit UI
+================================
+A beginner-friendly web interface for the water_quality_qc_v2 framework.
 
-Detection methods:
-- Range checks (physically plausible bounds)
-- Spike detection (z-score on first differences)
-- Persistence (stuck sensor / flatline)
-- Rate-of-change (unrealistic jumps)
-- ARIMA forecast residuals (optional, statsmodels)
+Run with:
+    streamlit run water_quality_qc_app.py
 
-All temperature configs are in °F by default. DO saturation internally
-converts °F → °C before applying the Garcia-Gordon equation.
+The UI handles file upload, parameter config, and visualization.
+The Python framework (water_quality_qc_v2.py) runs in the background.
 """
 
-from __future__ import annotations
-
-import warnings
-from dataclasses import dataclass, field
+import io
+import zipfile
+from dataclasses import asdict
 from pathlib import Path
-from typing import Optional
 
-import numpy as np
 import pandas as pd
+import streamlit as st
+import matplotlib.pyplot as plt
 
-warnings.filterwarnings("ignore")
+from water_quality_qc_v2 import (
+    WaterQualityQCv2,
+    ParameterConfig,
+    PARAMETER_CONFIGS,
+    generate_demo_data,
+    detect_timestamp_column,
+    align_to_grid,
+    __ENGINE_VERSION__,
+)
 
+from preset_loader import (
+    list_presets, configs_from_preset, auto_map_columns,
+    preset_to_session_state,
+)
+
+# ML backend selection: prefer LSTM (TensorFlow) if available, otherwise
+# fall back to sklearn-based learned models. Both expose the same API, so
+# the rest of the app uses a generic name (`ParameterModel`) and doesn't
+# care which one is active.
+_ML_BACKEND = None
+_ML_BACKEND_ERROR = ""
+
+# Try sklearn (learned_models) first — it's the lighter, more reliable path
+try:
+    from learned_models import (
+        LearnedConfig as ParameterConfig_ML,
+        ParameterLearned as ParameterModel,
+        derive_labels, compute_metrics,
+        DEFAULT_LABEL_TOLERANCES,
+    )
+    _ML_BACKEND = "sklearn"
+except ImportError as e:
+    _ML_BACKEND_ERROR = f"scikit-learn missing: {e}"
+
+# If the user explicitly has TF + lstm_models, they can override by setting
+# this env var, but we don't try to load TF eagerly because that's slow.
+import os as _os
+if _os.environ.get("WQC_USE_LSTM", "").lower() in ("1", "true", "yes"):
+    try:
+        from lstm_models import (
+            LSTMConfig as ParameterConfig_ML,
+            ParameterLSTM as ParameterModel,
+            derive_labels, compute_metrics,
+            DEFAULT_LABEL_TOLERANCES,
+        )
+        import tensorflow as _tf_check  # noqa: F401
+        _ML_BACKEND = "tensorflow_lstm"
+    except ImportError as e:
+        # Fall through — sklearn import above (if successful) stays active
+        pass
+
+_ML_AVAILABLE = _ML_BACKEND is not None
+
+# Backward-compat aliases so the rest of the file doesn't need to change
+_LSTM_AVAILABLE = _ML_AVAILABLE
+_LSTM_IMPORT_ERROR = _ML_BACKEND_ERROR
 
 # ---------------------------------------------------------------------------
-# Parameter configuration
+# Robust CSV reading (handles Excel exports: UTF-16, Latin-1, tabs, etc.)
 # ---------------------------------------------------------------------------
 
-@dataclass
-class ParameterConfig:
-    """Per-parameter QC settings.
+def read_csv_resilient(uploaded_file, label: str = "file") -> tuple[pd.DataFrame, str]:
+    """Read a CSV or Excel upload, handling common real-world quirks.
 
-    Note: defaults use large finite sentinels rather than np.inf, because
-    Streamlit's number_input widget cannot serialize infinity to JavaScript.
-    A range_min of -1e9 is effectively "no lower bound" for any real sensor.
+    Quirks handled:
+      - Multiple encodings (UTF-8, UTF-8-BOM, UTF-16, CP1252, Latin-1)
+      - Multiple delimiters (comma, tab, semicolon)
+      - Header row not at line 0 (AQUARIUS exports, Campbell exports)
+      - Excel files (.xlsx) — read directly
+
+    Returns (dataframe, note) describing what was detected so the user can see
+    in the alignment log.
     """
-    name: str
-    units: str = ""
-    range_min: float = -1e9
-    range_max: float = 1e9
-    spike_threshold: float = 4.0          # z-score on first differences
-    persistence_window: int = 6           # consecutive identical readings
-    persistence_tol: float = 1e-6
-    max_rate_change: float = 1e9          # per hour (effectively unlimited)
-    use_arima: bool = False
-    arima_order: tuple = (2, 0, 1)
-    arima_threshold: float = 3.5
+    from water_quality_qc_v2 import detect_csv_header_row
 
-    # ---- Event-aware flagging (set per-parameter; sensible defaults below)
-    # When True, suppress these flag types during a rain event.
-    suppress_spike_in_rain: bool = False
-    suppress_rate_in_rain: bool = False
-    suppress_range_min_in_high_stage: bool = False  # e.g. real hypoxia during floods
-    # When True, use covariates (rain, stage) in correction regression.
-    use_covariates_for_correction: bool = False
+    # Detect Excel by extension or content
+    filename = getattr(uploaded_file, "name", "").lower()
+    is_excel = filename.endswith((".xlsx", ".xls", ".xlsm"))
 
-
-# Sensible defaults for common aquatic sensors (Fahrenheit-first)
-PARAMETER_CONFIGS: dict[str, ParameterConfig] = {
-    "temperature": ParameterConfig(
-        name="temperature", units="°F",
-        range_min=32, range_max=95,
-        spike_threshold=4.0, persistence_window=12,
-        max_rate_change=9.0,
-        # Temp doesn't respond fast to storms — no suppression
-        use_covariates_for_correction=False,
-    ),
-    "specific_conductivity": ParameterConfig(
-        name="specific_conductivity", units="µS/cm",
-        range_min=0, range_max=2000,
-        spike_threshold=4.0, persistence_window=12,
-        max_rate_change=200,
-        # Rain dilutes conductivity rapidly — suppress rate flags during rain
-        suppress_rate_in_rain=True,
-        use_covariates_for_correction=True,
-    ),
-    "ph": ParameterConfig(
-        name="ph", units="pH",
-        range_min=4, range_max=10,
-        spike_threshold=3.5, persistence_window=12,
-        max_rate_change=1.0,
-        # Acid pulses from runoff are real
-        suppress_rate_in_rain=True,
-        use_covariates_for_correction=True,
-    ),
-    "dissolved_oxygen": ParameterConfig(
-        name="dissolved_oxygen", units="mg/L",
-        range_min=0, range_max=20,
-        spike_threshold=4.0, persistence_window=12,
-        max_rate_change=6.0,
-        # Floods cause real low-DO events
-        suppress_range_min_in_high_stage=True,
-        suppress_rate_in_rain=True,
-        use_covariates_for_correction=True,
-    ),
-    "turbidity": ParameterConfig(
-        name="turbidity", units="NTU",
-        range_min=0, range_max=1000,
-        spike_threshold=5.0, persistence_window=12,
-        max_rate_change=50,
-        # Sediment pulses during rain are real, not anomalies
-        suppress_spike_in_rain=True,
-        suppress_rate_in_rain=True,
-        use_covariates_for_correction=True,
-    ),
-}
-
-
-# ---------------------------------------------------------------------------
-# Main QC class
-# ---------------------------------------------------------------------------
-
-class WaterQualityQCv2:
-    """Run automated QC on a multi-parameter sensor dataframe.
-
-    Optional covariates:
-      rainfall_col   : column name for rainfall (per timestep, e.g. inches/5-min)
-      stage_col      : column name for stage (PT or radar, ft or m)
-
-    Event thresholds (control when "rain event" / "high stage" are True):
-      rain_window_hr      : hours over which to sum rainfall (default 1.0)
-      rain_event_threshold: cumulative rainfall over the window above which we
-                            consider it raining (default 0.05 inches)
-      stage_high_quantile : stage above this quantile is "high stage"
-                            (default 0.90)
-    """
-
-    def __init__(
-        self,
-        data: pd.DataFrame,
-        timestamp_col: str,
-        parameters: list[str],
-        configs: Optional[dict[str, ParameterConfig]] = None,
-        rainfall_col: Optional[str] = None,
-        stage_col: Optional[str] = None,
-        rain_window_hr: float = 1.0,
-        rain_event_threshold: float = 0.05,
-        stage_high_quantile: float = 0.90,
-    ):
-        self.data = data.copy()
-        self.timestamp_col = timestamp_col
-        self.parameters = parameters
-        self.rainfall_col = rainfall_col
-        self.stage_col = stage_col
-        self.rain_window_hr = rain_window_hr
-        self.rain_event_threshold = rain_event_threshold
-        self.stage_high_quantile = stage_high_quantile
-
-        # Parse timestamps and sort
-        self.data[timestamp_col] = pd.to_datetime(self.data[timestamp_col])
-        self.data = self.data.sort_values(timestamp_col).reset_index(drop=True)
-
-        # Merge user configs over defaults
-        self.configs: dict[str, ParameterConfig] = {}
-        for p in parameters:
-            if configs and p in configs:
-                self.configs[p] = configs[p]
-            elif p in PARAMETER_CONFIGS:
-                self.configs[p] = PARAMETER_CONFIGS[p]
-            else:
-                self.configs[p] = ParameterConfig(name=p)
-
-        # Storage for flags: one DataFrame per parameter
-        self.flags: dict[str, pd.DataFrame] = {}
-        # Storage for corrected series: one Series per parameter
-        self.corrected: dict[str, pd.Series] = {}
-
-        # Compute event indicators once, up front
-        self._compute_event_indicators()
-
-    # ---- Event detection -------------------------------------------------
-
-    def _compute_event_indicators(self) -> None:
-        """Derive rain_event and high_stage boolean masks from covariates."""
-        n = len(self.data)
-        self.rain_event = pd.Series(False, index=self.data.index)
-        self.high_stage = pd.Series(False, index=self.data.index)
-
-        if self.rainfall_col and self.rainfall_col in self.data.columns:
-            # Defensive numeric coercion — see note in run_parameter()
-            rain = pd.to_numeric(
-                self.data[self.rainfall_col], errors="coerce"
-            ).fillna(0)
-            # Detect sample frequency to size the rolling window
-            dt = self.data[self.timestamp_col].diff().median()
-            if pd.isna(dt) or dt.total_seconds() == 0:
-                samples_per_window = 12  # fallback
-            else:
-                samples_per_window = max(
-                    1,
-                    int(round(self.rain_window_hr * 3600 / dt.total_seconds())),
+    if is_excel:
+        # Excel: try the common AQUARIUS side-by-side layout first
+        uploaded_file.seek(0)
+        # Read all sheets, use the first
+        xl = pd.ExcelFile(uploaded_file)
+        sheet = xl.sheet_names[0]
+        # AQUARIUS side-by-side: header is on row 2 (0-indexed)
+        # Try row 0, 1, 2 and pick the one yielding the most named cols
+        best_df, best_hdr = None, 0
+        best_score = -1
+        for hdr in (0, 1, 2):
+            try:
+                df_try = pd.read_excel(xl, sheet_name=sheet, header=hdr)
+                # Score: count columns whose name is a non-empty string and not "Unnamed: N"
+                score = sum(
+                    1 for c in df_try.columns
+                    if isinstance(c, str) and c and not c.startswith("Unnamed:")
                 )
-            rolling = rain.rolling(samples_per_window, min_periods=1).sum()
-            self.rain_event = rolling >= self.rain_event_threshold
-            self.data["_rain_rolling"] = rolling
-
-        if self.stage_col and self.stage_col in self.data.columns:
-            stage = pd.to_numeric(self.data[self.stage_col], errors="coerce")
-            cutoff = stage.quantile(self.stage_high_quantile)
-            if pd.notna(cutoff):
-                self.high_stage = stage >= cutoff
-                self.data["_stage_cutoff"] = cutoff
-
-    # ---- Detection methods ------------------------------------------------
-
-    def _flag_range(self, series: pd.Series, cfg: ParameterConfig) -> pd.Series:
-        return (series < cfg.range_min) | (series > cfg.range_max)
-
-    def _flag_spike(self, series: pd.Series, cfg: ParameterConfig) -> pd.Series:
-        diff = series.diff()
-        mean, std = diff.mean(), diff.std()
-        if std == 0 or np.isnan(std):
-            return pd.Series(False, index=series.index)
-        z = (diff - mean).abs() / std
-        return z > cfg.spike_threshold
-
-    def _flag_persistence(self, series: pd.Series, cfg: ParameterConfig) -> pd.Series:
-        flat = series.diff().abs() < cfg.persistence_tol
-        # Mark runs of length >= persistence_window
-        groups = (~flat).cumsum()
-        run_lengths = flat.groupby(groups).transform("sum")
-        return flat & (run_lengths >= cfg.persistence_window)
-
-    def _flag_rate(self, series: pd.Series, cfg: ParameterConfig) -> pd.Series:
-        if cfg.max_rate_change >= 1e9:
-            return pd.Series(False, index=series.index)
-        dt_hours = (
-            self.data[self.timestamp_col]
-            .diff().dt.total_seconds() / 3600
-        )
-        rate = (series.diff() / dt_hours).abs()
-        return rate > cfg.max_rate_change
-
-    def _flag_arima(self, series: pd.Series, cfg: ParameterConfig) -> pd.Series:
-        if not cfg.use_arima:
-            return pd.Series(False, index=series.index)
-        try:
-            from statsmodels.tsa.arima.model import ARIMA
-            clean = series.dropna()
-            if len(clean) < 50:
-                return pd.Series(False, index=series.index)
-            model = ARIMA(clean, order=cfg.arima_order).fit()
-            resid = model.resid
-            z = (resid - resid.mean()).abs() / resid.std()
-            flagged = pd.Series(False, index=series.index)
-            flagged.loc[clean.index] = z > cfg.arima_threshold
-            return flagged
-        except Exception:
-            return pd.Series(False, index=series.index)
-
-    # ---- Orchestration ----------------------------------------------------
-
-    def run_parameter(self, parameter: str) -> pd.DataFrame:
-        cfg = self.configs[parameter]
-        # Defensively coerce to numeric — the user may have mapped a column
-        # that came in as strings (e.g. CSV cell with stray text, an empty
-        # column, or PyArrow-string-typed values from pandas 2.x). All five
-        # detectors below assume a numeric series.
-        series = pd.to_numeric(self.data[parameter], errors="coerce")
-
-        flags = pd.DataFrame({
-            "range": self._flag_range(series, cfg),
-            "spike": self._flag_spike(series, cfg),
-            "persistence": self._flag_persistence(series, cfg),
-            "rate_of_change": self._flag_rate(series, cfg),
-            "arima": self._flag_arima(series, cfg),
-        }, index=series.index)
-
-        # Capture raw (pre-suppression) flags for transparency
-        flags_raw = flags.copy()
-
-        # ---- Event-aware suppression ----
-        suppressed = pd.DataFrame(False, index=flags.index, columns=flags.columns)
-        if cfg.suppress_spike_in_rain and self.rain_event.any():
-            mask = flags["spike"] & self.rain_event
-            suppressed["spike"] = mask
-            flags.loc[mask, "spike"] = False
-        if cfg.suppress_rate_in_rain and self.rain_event.any():
-            mask = flags["rate_of_change"] & self.rain_event
-            suppressed["rate_of_change"] = mask
-            flags.loc[mask, "rate_of_change"] = False
-        if cfg.suppress_range_min_in_high_stage and self.high_stage.any():
-            # Only suppress low-end range violations, not high
-            below_min = series < cfg.range_min
-            mask = flags["range"] & self.high_stage & below_min
-            suppressed["range"] = mask
-            flags.loc[mask, "range"] = False
-
-        flags["any"] = flags.any(axis=1)
-        flags["suppressed"] = suppressed.any(axis=1)
-        flags["rain_event"] = self.rain_event.values
-        flags["high_stage"] = self.high_stage.values
-        # Keep raw flags side-by-side for audit
-        for col in ["range", "spike", "rate_of_change"]:
-            flags[f"{col}_raw"] = flags_raw[col]
-
-        self.flags[parameter] = flags
-        return flags
-
-    def run_all_sequential(self) -> dict[str, pd.DataFrame]:
-        for p in self.parameters:
-            if p in self.data.columns:
-                self.run_parameter(p)
-        return self.flags
-
-    # ---- Correction -------------------------------------------------------
-
-    def correct_parameter(
-        self,
-        parameter: str,
-        max_gap_for_interp: int = 4,
-    ) -> pd.Series:
-        """Build a corrected series for one parameter.
-
-        Strategy (in order):
-          1. Start with the raw series.
-          2. Set flagged points to NaN.
-          3. For short gaps (<= max_gap_for_interp samples), linear interpolate.
-          4. For longer gaps, if covariates are enabled, predict from a
-             rainfall/stage regression fit on the un-flagged surroundings.
-             Otherwise, linear interpolate the remainder anyway.
-          5. Cross-fade the regression prediction with linear interpolation
-             at the gap edges so corrected values join smoothly.
-        """
-        if parameter not in self.flags:
-            raise ValueError(f"Run QC for '{parameter}' before correcting.")
-
-        cfg = self.configs[parameter]
-        flags = self.flags[parameter]
-        raw = self.data[parameter].astype(float).copy()
-
-        # Step 1-2: blank out flagged points
-        working = raw.copy()
-        working[flags["any"]] = np.nan
-
-        # Step 3: short-gap linear interpolation
-        working = working.interpolate(
-            method="linear", limit=max_gap_for_interp, limit_area="inside",
-        )
-
-        # Step 4: longer gaps - covariate regression (if enabled and possible)
-        still_missing = working.isna() & flags["any"]
-        if cfg.use_covariates_for_correction and still_missing.any():
-            predicted = self._covariate_predict(parameter, raw, flags["any"])
-            if predicted is not None:
-                # Cross-fade: at gap edges, blend with linear interp for continuity
-                blended = self._cross_fade(working, predicted, still_missing)
-                working = working.where(~still_missing, blended)
-
-        # Step 5: any remaining NaNs get a final linear interpolation
-        working = working.interpolate(method="linear", limit_area="inside")
-        # And forward/backward fill at the very edges if needed
-        working = working.ffill().bfill()
-
-        self.corrected[parameter] = working
-        return working
-
-    def _covariate_predict(
-        self,
-        parameter: str,
-        raw: pd.Series,
-        flagged: pd.Series,
-    ) -> Optional[pd.Series]:
-        """Fit a simple linear regression of the parameter on available
-        covariates using un-flagged points; return predictions for all rows.
-
-        Returns None if no covariates are available or fit fails.
-        """
-        X_parts = []
-        if self.rainfall_col and self.rainfall_col in self.data.columns:
-            rain = self.data[self.rainfall_col].fillna(0)
-            X_parts.append(("rain", rain))
-            if "_rain_rolling" in self.data.columns:
-                X_parts.append(("rain_roll", self.data["_rain_rolling"]))
-        if self.stage_col and self.stage_col in self.data.columns:
-            stage = self.data[self.stage_col]
-            X_parts.append(("stage", stage))
-            X_parts.append(("stage_diff", stage.diff().fillna(0)))
-
-        if not X_parts:
-            return None
-
-        # Build design matrix
-        X_df = pd.DataFrame({name: vals.values for name, vals in X_parts},
-                            index=raw.index).astype(float)
-        X_df = X_df.fillna(X_df.median(numeric_only=True))
-
-        # Fit on un-flagged points only
-        y = raw.copy()
-        train_mask = (~flagged) & y.notna()
-        if train_mask.sum() < max(20, 4 * X_df.shape[1]):
-            return None  # not enough clean data to fit
-
-        X_train = X_df.loc[train_mask].values
-        y_train = y.loc[train_mask].values
-
-        # Least-squares with intercept
-        try:
-            X_aug = np.column_stack([np.ones(len(X_train)), X_train])
-            coefs, *_ = np.linalg.lstsq(X_aug, y_train, rcond=None)
-            X_all_aug = np.column_stack([np.ones(len(X_df)), X_df.values])
-            preds = X_all_aug @ coefs
-            return pd.Series(preds, index=raw.index)
-        except Exception:
-            return None
-
-    @staticmethod
-    def _cross_fade(
-        interpolated: pd.Series,
-        predicted: pd.Series,
-        gap_mask: pd.Series,
-        fade_samples: int = 4,
-    ) -> pd.Series:
-        """Within each gap, weight predicted values heavily in the middle and
-        the interpolated/linear-trend values at the edges, so the joins are
-        seamless. PyHydroQC-style cross-fade.
-        """
-        out = predicted.copy()
-        # Identify gap groups (runs of True in gap_mask)
-        gap_id = (gap_mask != gap_mask.shift()).cumsum()
-        for gid, idx in gap_mask.groupby(gap_id).groups.items():
-            if not gap_mask.loc[idx].iloc[0]:
+                if score > best_score:
+                    best_score = score
+                    best_df = df_try
+                    best_hdr = hdr
+            except Exception:
                 continue
-            n = len(idx)
-            # Build a triangular weight: 0 at edges -> 1 in middle, over fade_samples
-            fade = min(fade_samples, n // 2)
-            w = np.ones(n)
-            if fade > 0:
-                ramp = np.linspace(0, 1, fade + 1)[1:]
-                w[:fade] = ramp
-                w[-fade:] = ramp[::-1]
-            # Linear endpoint anchor: use neighboring non-gap values
-            pre_idx = idx[0] - 1
-            post_idx = idx[-1] + 1
-            if pre_idx in interpolated.index and post_idx in interpolated.index:
-                pre_val = interpolated.iloc[pre_idx]
-                post_val = interpolated.iloc[post_idx]
-                if pd.notna(pre_val) and pd.notna(post_val):
-                    linear = np.linspace(pre_val, post_val, n + 2)[1:-1]
-                    pred_vals = predicted.loc[idx].values
-                    blended = w * pred_vals + (1 - w) * linear
-                    out.loc[idx] = blended
-        return out
+        if best_df is None or best_score < 2:
+            raise ValueError(f"Could not parse Excel {label}: no readable header found.")
+        note = f"format=Excel, sheet={sheet!r}, header_row={best_hdr}"
+        return best_df, note
 
-    def correct_all(self, max_gap_for_interp: int = 4) -> dict[str, pd.Series]:
-        for p in self.parameters:
-            if p in self.flags:
-                self.correct_parameter(p, max_gap_for_interp=max_gap_for_interp)
-        return self.corrected
+    # CSV path
+    encodings = ["utf-8", "utf-8-sig", "utf-16", "cp1252", "latin-1"]
+    separators = [",", "\t", ";"]
 
-    # ---- Reporting --------------------------------------------------------
+    # Auto-detect the header row (skips comments, UUID rows, units rows)
+    try:
+        hdr_row = detect_csv_header_row(uploaded_file)
+    except Exception:
+        hdr_row = 0
 
-    def summary(self) -> pd.DataFrame:
-        rows = []
-        for p, f in self.flags.items():
-            n = len(f)
-            row = {"parameter": p, "units": self.configs[p].units, "n_records": n}
-            for col in ["range", "spike", "persistence", "rate_of_change", "arima", "any"]:
-                row[col] = int(f[col].sum())
-            row["suppressed_by_events"] = int(f["suppressed"].sum())
-            row["pct_flagged"] = round(100 * f["any"].sum() / n, 2) if n else 0
-            rows.append(row)
-        return pd.DataFrame(rows)
+    last_err = None
+    for enc in encodings:
+        for sep in separators:
+            try:
+                uploaded_file.seek(0)
+                df = pd.read_csv(
+                    uploaded_file,
+                    encoding=enc, sep=sep,
+                    skiprows=hdr_row if hdr_row > 0 else None,
+                )
+                if df.shape[1] >= 2:
+                    note = f"encoding={enc}"
+                    if sep != ",":
+                        note += f", sep={'TAB' if sep == chr(9) else repr(sep)}"
+                    if hdr_row > 0:
+                        note += f", header_row={hdr_row}"
+                    return df, note
+            except (UnicodeDecodeError, UnicodeError) as e:
+                last_err = e
+                break  # encoding wrong → no point trying more separators
+            except Exception as e:
+                last_err = e
+                continue
+    raise ValueError(
+        f"Could not read {label}. Tried encodings {encodings} and "
+        f"separators {separators}. Last error: {last_err}"
+    )
 
-    def write_summary_report(self, path: str | Path) -> Path:
-        path = Path(path)
-        s = self.summary()
-        lines = [
+# ---------------------------------------------------------------------------
+# Page setup
+# ---------------------------------------------------------------------------
+
+st.set_page_config(
+    page_title="Water Quality QC",
+    page_icon="💧",
+    layout="wide",
+    initial_sidebar_state="expanded",
+)
+
+st.title("💧 Water Quality QC Tool")
+st.caption(
+    "Upload sensor data, configure thresholds, and flag anomalies. "
+    "The Python QC engine runs in the background — no coding required.  "
+    f"·  Engine v{__ENGINE_VERSION__}"
+)
+
+# ---------------------------------------------------------------------------
+# Session state
+# ---------------------------------------------------------------------------
+
+if "data" not in st.session_state:
+    st.session_state.data = None
+if "qc" not in st.session_state:
+    st.session_state.qc = None
+if "alignment_log" not in st.session_state:
+    st.session_state.alignment_log = []
+
+# ---------------------------------------------------------------------------
+# Sidebar: data sources (WQ + optional rainfall + optional stage)
+# ---------------------------------------------------------------------------
+
+with st.sidebar:
+    st.header("1. Data sources")
+
+    source = st.radio(
+        "Choose data source",
+        ["Upload CSV files", "Try demo data"],
+        label_visibility="collapsed",
+    )
+
+    if source == "Try demo data":
+        if st.button("Generate demo data", use_container_width=True):
+            st.session_state.data = generate_demo_data()
+            st.session_state._resample_decided = False
+            st.session_state._resample_diag = None
+            st.session_state.alignment_log = [
+                "Demo data: rainfall + stage already on the WQ grid (no alignment needed)."
+            ]
+            st.success(f"Generated {len(st.session_state.data):,} rows of demo data")
+    else:
+        st.markdown("**Water quality CSV** *(required)*")
+        wq_file = st.file_uploader(
+            "Timestamp + parameter columns",
+            type=["csv", "xlsx", "xls"], key="wq_upload",
+            label_visibility="collapsed",
+        )
+
+        st.markdown("**Rainfall CSV** *(optional, separate file)*")
+        rain_file = st.file_uploader(
+            "Timestamp + rainfall column",
+            type=["csv", "xlsx", "xls"], key="rain_upload",
+            label_visibility="collapsed",
+        )
+
+        st.markdown("**Stage CSV** *(optional, separate file)*")
+        stage_file = st.file_uploader(
+            "Timestamp + stage column",
+            type=["csv", "xlsx", "xls"], key="stage_upload",
+            label_visibility="collapsed",
+        )
+
+        tol_min = st.number_input(
+            "Timestamp alignment tolerance (minutes)",
+            min_value=0.5, max_value=120.0, value=10.0, step=0.5,
+            help=(
+                "When matching rainfall/stage to the WQ grid, samples outside "
+                "this window become NaN. Use ~half your WQ sampling interval "
+                "as a starting point (e.g. 7.5 min for 15-min WQ data)."
+            ),
+        )
+
+        if st.button("📥 Load & align files", use_container_width=True,
+                     disabled=wq_file is None):
+            log = []
+            try:
+                wq_df, wq_note = read_csv_resilient(wq_file, "water quality file")
+            except Exception as e:
+                st.error(f"Couldn't read the WQ file: {e}")
+                st.stop()
+            wq_ts = detect_timestamp_column(wq_df)
+            if wq_ts is None:
+                st.error("Couldn't auto-detect a timestamp column in the WQ file.")
+                st.stop()
+            log.append(
+                f"WQ: {len(wq_df):,} rows, {wq_note}. "
+                f"Timestamp column: '{wq_ts}'."
+            )
+
+            merged = wq_df.copy()
+
+            # ---- Rainfall alignment ----
+            if rain_file is not None:
+                try:
+                    rain_df, rain_note = read_csv_resilient(rain_file, "rainfall file")
+                except Exception as e:
+                    log.append(f"⚠️ Rainfall file: couldn't read — {e}. Skipped.")
+                    rain_df = None
+                if rain_df is not None:
+                    rain_ts = detect_timestamp_column(rain_df)
+                    if rain_ts is None:
+                        log.append(
+                            f"⚠️ Rainfall file ({rain_note}): couldn't detect "
+                            f"timestamp column — skipped."
+                        )
+                    else:
+                        rain_value_cols = [c for c in rain_df.columns if c != rain_ts]
+                        merged, diag = align_to_grid(
+                            merged, wq_ts, rain_df, rain_ts,
+                            rain_value_cols, tolerance_minutes=tol_min,
+                        )
+                        log.append(
+                            f"Rainfall: {len(rain_df):,} rows, {rain_note}. "
+                            f"Timestamp column: '{rain_ts}'."
+                        )
+                        for vc in rain_value_cols:
+                            log.append(
+                                f"  └ '{vc}': {diag[f'{vc}_matched']:,} / "
+                                f"{diag['target_rows']:,} matched "
+                                f"({diag[f'{vc}_match_pct']}%) within {tol_min} min."
+                            )
+
+            # ---- Stage alignment ----
+            if stage_file is not None:
+                try:
+                    stage_df, stage_note = read_csv_resilient(stage_file, "stage file")
+                except Exception as e:
+                    log.append(f"⚠️ Stage file: couldn't read — {e}. Skipped.")
+                    stage_df = None
+                if stage_df is not None:
+                    stage_ts = detect_timestamp_column(stage_df)
+                    if stage_ts is None:
+                        log.append(
+                            f"⚠️ Stage file ({stage_note}): couldn't detect "
+                            f"timestamp column — skipped."
+                        )
+                    else:
+                        stage_value_cols = [c for c in stage_df.columns if c != stage_ts]
+                        merged, diag = align_to_grid(
+                            merged, wq_ts, stage_df, stage_ts,
+                            stage_value_cols, tolerance_minutes=tol_min,
+                        )
+                        log.append(
+                            f"Stage: {len(stage_df):,} rows, {stage_note}. "
+                            f"Timestamp column: '{stage_ts}'."
+                        )
+                        for vc in stage_value_cols:
+                            log.append(
+                                f"  └ '{vc}': {diag[f'{vc}_matched']:,} / "
+                                f"{diag['target_rows']:,} matched "
+                                f"({diag[f'{vc}_match_pct']}%) within {tol_min} min."
+                            )
+
+            st.session_state.data = merged
+            st.session_state._resample_decided = False
+            st.session_state._resample_diag = None
+            st.session_state.alignment_log = log
+            st.success(f"Loaded and aligned: {len(merged):,} rows × {len(merged.columns)} columns.")
+
+# ---------------------------------------------------------------------------
+# Main area: only show once data is loaded
+# ---------------------------------------------------------------------------
+
+if st.session_state.data is None:
+    st.info(
+        "👈 Load data from the sidebar to get started. "
+        "Click **Generate demo data** if you just want to try the tool."
+    )
+    st.stop()
+
+data = st.session_state.data
+
+# ----- Alignment log ------------------------------------------------------
+
+if st.session_state.alignment_log:
+    with st.expander("🔗 File alignment log", expanded=True):
+        for line in st.session_state.alignment_log:
+            st.markdown(f"- {line}")
+        st.caption(
+            "Tip: if match % is lower than expected, your timestamps may be in "
+            "different timezones, or the tolerance may be too tight. "
+            "Unmatched rows become NaN, which the QC engine handles safely."
+        )
+
+# ----- Preview ------------------------------------------------------------
+
+with st.expander("📋 Data preview", expanded=False):
+    st.dataframe(data.head(20), use_container_width=True)
+    st.caption(f"Shape: {data.shape[0]:,} rows × {data.shape[1]} columns")
+
+# ----- Cadence detection + optional auto-resample -------------------------
+
+from water_quality_qc_v2 import (
+    detect_column_cadences, needs_resampling, resample_to_grid,
+)
+
+# Detect timestamp column (first column that parses as datetimes)
+_probe_ts_col = None
+for _c in data.columns:
+    try:
+        _parsed = pd.to_datetime(data[_c].head(50), errors="raise")
+        if _parsed.notna().all():
+            _probe_ts_col = _c
+            break
+    except Exception:
+        continue
+
+if _probe_ts_col is not None:
+    _cadence_report = detect_column_cadences(data, _probe_ts_col)
+    _mixed = needs_resampling(_cadence_report)
+    if _mixed and not st.session_state.get("_resample_decided"):
+        st.warning(
+            "⚠️ **Mixed sampling cadences detected.** Some columns are at "
+            "different intervals (likely a Campbell-logger-style export). "
+            "If left unresampled, covariates on a different cadence than the "
+            "WQ sensor will appear mostly NaN and won't contribute to QC."
+        )
+        with st.expander("Cadence details", expanded=True):
+            st.dataframe(_cadence_report, use_container_width=True, hide_index=True)
+
+        # Default target = median of cadences (excluding outliers)
+        _valid_cads = _cadence_report.dropna(subset=["mode_interval_min"])
+        _default_target = (
+            float(_valid_cads["mode_interval_min"].median())
+            if len(_valid_cads) else 15.0
+        )
+
+        rcol1, rcol2, rcol3 = st.columns([2, 2, 1])
+        with rcol1:
+            _target_interval = st.number_input(
+                "Resample target interval (minutes)",
+                min_value=1.0, max_value=240.0,
+                value=_default_target, step=1.0,
+                help="All columns will be regridded to this cadence. Rainfall is summed; everything else uses nearest-neighbor.",
+            )
+        with rcol2:
+            # Guess rainfall column by name hint
+            _rain_guess = [
+                c for c in data.columns
+                if any(h in c.lower() for h in ("precip", "rain", "rg"))
+            ]
+            _rain_cols_sel = st.multiselect(
+                "Rainfall column(s) (will be SUMMED per bin)",
+                options=[c for c in data.columns if c != _probe_ts_col],
+                default=_rain_guess,
+            )
+        with rcol3:
+            st.write("")  # spacer for alignment
+            st.write("")
+            if st.button("🔄 Auto-resample", type="primary", use_container_width=True):
+                with st.spinner(f"Resampling to {_target_interval}-min grid..."):
+                    new_data, diag = resample_to_grid(
+                        data, _probe_ts_col,
+                        target_interval_minutes=_target_interval,
+                        rainfall_cols=_rain_cols_sel,
+                    )
+                st.session_state.data = new_data
+                st.session_state._resample_decided = True
+                st.session_state._resample_diag = {
+                    "target_interval": _target_interval,
+                    "n_rows_before": len(data),
+                    "n_rows_after": len(new_data),
+                    "rainfall_cols": _rain_cols_sel,
+                }
+                st.rerun()
+            if st.button("Keep as-is", use_container_width=True):
+                st.session_state._resample_decided = True
+                st.session_state._resample_diag = {
+                    "kept_mixed": True,
+                    "n_rows": len(data),
+                }
+                st.rerun()
+        st.stop()  # Don't proceed until user decides
+
+    elif st.session_state.get("_resample_diag"):
+        diag = st.session_state["_resample_diag"]
+        if diag.get("kept_mixed"):
+            st.info(
+                f"📊 **Mixed-cadence file kept as-is** ({diag['n_rows']:,} rows). "
+                "Some covariates may be NaN at WQ timestamps."
+            )
+        else:
+            st.success(
+                f"✅ **Resampled** from {diag['n_rows_before']:,} rows to "
+                f"{diag['n_rows_after']:,} rows on a {diag['target_interval']}-min grid. "
+                f"Rainfall cols summed: {diag.get('rainfall_cols') or 'none'}."
+            )
+
+# ===========================================================================
+# Tabs: Rules-based QC  |  LSTM Train  |  LSTM Detect & Validate
+# ===========================================================================
+
+tab_rules, tab_train, tab_lstm = st.tabs([
+    "🔧 Rules-based QC",
+    "🧠 Train Model",
+    "🔬 Detect & Validate",
+])
+
+with tab_rules:
+
+    # ----- Station preset selector --------------------------------------------
+
+    st.subheader("1b. Station preset (optional)")
+    st.caption(
+        "Load saved settings for a specific monitoring station. Presets pre-fill "
+        "thresholds, column mappings, and event-aware behavior. You can still "
+        "override any value below."
+    )
+
+    # Resolve presets folder relative to THIS file, not the current working
+    # directory — so it works regardless of where Streamlit was launched from.
+    _APP_DIR = Path(__file__).resolve().parent
+    _PRESETS_DIR = _APP_DIR / "presets"
+
+    presets = list_presets(_PRESETS_DIR)
+
+    if not presets:
+        st.warning(
+            f"⚠️ **No presets found.** Expected JSON files in:  \n"
+            f"`{_PRESETS_DIR}`  \n\n"
+            "Common causes:\n"
+            "- The `presets/` folder didn't get pushed to your repo or copied "
+            "to the deployment.\n"
+            "- The folder is there but the JSON files were not unzipped along "
+            "with the Python files.\n\n"
+            "**Fix:** make sure the `presets/` folder sits next to "
+            "`water_quality_qc_app.py` and contains files like `KINA.json`, "
+            "`SMIB.json`, `_generic_freshwater.json`."
+        )
+        # Diagnostic: list whatever IS at _APP_DIR so the user can self-debug
+        try:
+            siblings = sorted(p.name for p in _APP_DIR.iterdir())
+            with st.expander("What's in the app folder?", expanded=False):
+                st.code("\n".join(siblings) or "(empty)")
+        except Exception as e:
+            st.caption(f"(Couldn't list app folder: {e})")
+
+    preset_labels = ["— No preset (use defaults) —"] + [
+        f"{p['station_name']}"
+        + (f"  ({p['n_parameters']} params)" if p['n_parameters'] else "")
+        for p in presets
+    ]
+    preset_choice = st.selectbox(
+        "Select a station preset",
+        options=range(len(preset_labels)),
+        format_func=lambda i: preset_labels[i],
+        index=0,
+        label_visibility="collapsed",
+    )
+
+    active_preset = None
+    if preset_choice > 0:
+        active_preset = presets[preset_choice - 1]
+        if active_preset["_data"]:
+            with st.expander(
+                f"ℹ️ About: {active_preset['station_name']}", expanded=False
+            ):
+                if active_preset["description"]:
+                    st.write(active_preset["description"])
+                st.caption(
+                    f"Source: `{active_preset['filename']}`  •  "
+                    f"Sampling: {active_preset['_data'].get('sampling_interval_minutes', '?')} min  •  "
+                    f"Version: {active_preset['_data'].get('version', '?')}  •  "
+                    f"Last updated: {active_preset['_data'].get('last_updated', '?')}"
+                )
+        else:
+            active_preset = None  # invalid preset
+            st.warning("Selected preset is invalid — proceeding with defaults.")
+
+    # If a preset is active, build auto-map suggestions
+    auto_map = {}
+    if active_preset and active_preset["_data"]:
+        auto_map = auto_map_columns(data.columns.tolist(), active_preset["_data"])
+
+    # ----- Column mapping -----------------------------------------------------
+
+    st.subheader("2. Map your columns")
+
+    # Pre-select timestamp from auto-map if available
+    ts_default_idx = 0
+    if auto_map.get("timestamp") in data.columns:
+        ts_default_idx = data.columns.tolist().index(auto_map["timestamp"])
+
+    col1, col2 = st.columns([1, 2])
+    with col1:
+        ts_col = st.selectbox(
+            "Timestamp column",
+            options=data.columns.tolist(),
+            index=ts_default_idx,
+        )
+
+    # Default parameters: auto-map results if preset is active, else
+    # any column matching PARAMETER_CONFIGS keys
+    if active_preset and auto_map:
+        default_params = [
+            auto_map[k] for k in
+            ["pH", "temperature", "turbidity", "specific_conductivity",
+             "dissolved_oxygen", "stage"]
+            if auto_map.get(k) and auto_map[k] in data.columns and auto_map[k] != ts_col
+        ]
+    else:
+        default_params = [c for c in data.columns if c in PARAMETER_CONFIGS]
+
+    with col2:
+        param_cols = st.multiselect(
+            "Parameter columns to QC",
+            options=[c for c in data.columns if c != ts_col],
+            default=default_params,
+        )
+
+    # ----- Covariate mapping (rainfall + stage) -------------------------------
+
+    st.subheader("2b. Covariates (rainfall + stage)")
+    st.caption(
+        "Optional but powerful. Rainfall and stage are used to (1) suppress "
+        "false-positive flags during real hydrologic events and (2) inform "
+        "correction estimates via regression."
+    )
+
+    cv1, cv2 = st.columns(2)
+    # Determine preset defaults for covariates
+    if active_preset and active_preset["_data"]:
+        _cov_defaults = active_preset["_data"].get("covariates", {})
+        _rain_default = auto_map.get("rainfall") if auto_map.get("rainfall") in data.columns else None
+        _stage_default = auto_map.get("stage") if auto_map.get("stage") in data.columns else None
+        _rain_win_default = float(_cov_defaults.get("rain_window_hr", 1.0))
+        _rain_thr_default = float(_cov_defaults.get("rain_event_threshold", 0.05))
+        _stage_q_default = float(_cov_defaults.get("stage_high_quantile", 0.90))
+    else:
+        _rain_default = "rainfall" if "rainfall" in data.columns else None
+        _stage_default = "stage" if "stage" in data.columns else None
+        _rain_win_default = 1.0
+        _rain_thr_default = 0.05
+        _stage_q_default = 0.90
+
+    _rain_options = ["— none —"] + [c for c in data.columns if c != ts_col]
+    _stage_options = ["— none —"] + [c for c in data.columns if c != ts_col]
+
+    with cv1:
+        rainfall_col = st.selectbox(
+            "Rainfall column (e.g. inches per timestep)",
+            options=_rain_options,
+            index=_rain_options.index(_rain_default) if _rain_default in _rain_options else 0,
+        )
+        rain_window_hr = st.number_input(
+            "Rolling window for rain events (hr)",
+            min_value=0.25, max_value=24.0,
+            value=_rain_win_default, step=0.25,
+        )
+        rain_event_threshold = st.number_input(
+            "Rain total over window to call it an 'event' (same units as rainfall col)",
+            min_value=0.0, value=_rain_thr_default, step=0.01, format="%.3f",
+        )
+    with cv2:
+        stage_col = st.selectbox(
+            "Stage column (PT or radar, ft/m)",
+            options=_stage_options,
+            index=_stage_options.index(_stage_default) if _stage_default in _stage_options else 0,
+        )
+        stage_high_quantile = st.slider(
+            "Stage quantile considered 'high stage'",
+            min_value=0.50, max_value=0.99,
+            value=_stage_q_default, step=0.01,
+        )
+
+    # Convert "none" sentinel to None
+    rainfall_col = None if rainfall_col == "— none —" else rainfall_col
+    stage_col = None if stage_col == "— none —" else stage_col
+
+    # Warn if a selected covariate is mostly NaN at WQ timestamps
+    def _check_covariate_density(col_name, label):
+        if col_name and col_name in data.columns:
+            pct_valid = data[col_name].notna().mean() * 100
+            if pct_valid < 50:
+                st.warning(
+                    f"⚠️ **{label} column `{col_name}` is {100 - pct_valid:.0f}% empty** "
+                    f"at your WQ timestamps. The {label.lower()} feature won't "
+                    "contribute meaningfully to event suppression or correction. "
+                    "Consider running auto-resample (above) or uploading the "
+                    f"{label.lower()} data as a separate file."
+                )
+    _check_covariate_density(rainfall_col, "Rainfall")
+    _check_covariate_density(stage_col, "Stage")
+
+    # ----- Parameter configs (collapsible) ------------------------------------
+
+    st.subheader("3. Configure detection thresholds")
+    st.caption("Defaults are sensible for typical aquatic sensors — tweak per parameter if needed.")
+
+    import math
+
+
+    def _safe_float(value: float, fallback: float) -> float:
+        """Streamlit's number_input cannot render NaN or infinity.
+        Clamp those to a finite fallback before passing to the widget."""
+        if value is None or math.isnan(value) or math.isinf(value):
+            return fallback
+        return float(value)
+
+
+    # If a preset is active, build a map from (actual column name) -> ParameterConfig
+    preset_configs_by_col: dict[str, ParameterConfig] = {}
+    if active_preset and active_preset["_data"]:
+        preset_canon_configs = configs_from_preset(active_preset["_data"])
+        # auto_map: canonical -> actual column. Invert it.
+        canon_to_col = {k: v for k, v in auto_map.items() if v}
+        for canon, cfg in preset_canon_configs.items():
+            actual_col = canon_to_col.get(canon)
+            if actual_col:
+                # Re-create config with the actual column name as `name` so it
+                # round-trips through the existing per-param loop unchanged
+                cfg_dict = {**asdict(cfg), "name": actual_col}
+                preset_configs_by_col[actual_col] = ParameterConfig(**cfg_dict)
+
+    custom_configs: dict[str, ParameterConfig] = {}
+    for p in param_cols:
+        # Priority: preset > built-in default > blank
+        default = preset_configs_by_col.get(p) or PARAMETER_CONFIGS.get(p) or ParameterConfig(name=p)
+        preset_tag = " (from preset)" if p in preset_configs_by_col else ""
+        with st.expander(f"⚙️ {p} ({default.units or 'no units'}){preset_tag}"):
+            c1, c2, c3 = st.columns(3)
+            with c1:
+                rmin = st.number_input(
+                    "Min range",
+                    value=_safe_float(default.range_min, -1e6),
+                    key=f"{p}_min",
+                )
+                rmax = st.number_input(
+                    "Max range",
+                    value=_safe_float(default.range_max, 1e6),
+                    key=f"{p}_max",
+                )
+            with c2:
+                spike = st.number_input(
+                    "Spike z-threshold",
+                    value=_safe_float(default.spike_threshold, 4.0),
+                    key=f"{p}_spike",
+                )
+                pers = st.number_input(
+                    "Persistence window",
+                    value=int(default.persistence_window),
+                    step=1,
+                    key=f"{p}_pers",
+                )
+            with c3:
+                rate = st.number_input(
+                    "Max rate/hr",
+                    value=_safe_float(default.max_rate_change, 1e6),
+                    key=f"{p}_rate",
+                )
+                arima = st.checkbox("Use ARIMA", value=default.use_arima, key=f"{p}_arima")
+
+            st.markdown("**Event-aware behavior** (uses rainfall / stage)")
+            e1, e2, e3, e4 = st.columns(4)
+            with e1:
+                sup_spike_rain = st.checkbox(
+                    "Suppress spike flags during rain",
+                    value=default.suppress_spike_in_rain,
+                    key=f"{p}_sup_spike",
+                    disabled=rainfall_col is None,
+                )
+            with e2:
+                sup_rate_rain = st.checkbox(
+                    "Suppress rate flags during rain",
+                    value=default.suppress_rate_in_rain,
+                    key=f"{p}_sup_rate",
+                    disabled=rainfall_col is None,
+                )
+            with e3:
+                sup_min_stage = st.checkbox(
+                    "Suppress range-min flags during high stage",
+                    value=default.suppress_range_min_in_high_stage,
+                    key=f"{p}_sup_min",
+                    disabled=stage_col is None,
+                )
+            with e4:
+                use_cov = st.checkbox(
+                    "Use covariates for correction",
+                    value=default.use_covariates_for_correction,
+                    key=f"{p}_use_cov",
+                    disabled=(rainfall_col is None and stage_col is None),
+                )
+
+            custom_configs[p] = ParameterConfig(
+                name=p, units=default.units,
+                range_min=rmin, range_max=rmax,
+                spike_threshold=spike, persistence_window=pers,
+                max_rate_change=rate, use_arima=arima,
+                suppress_spike_in_rain=sup_spike_rain,
+                suppress_rate_in_rain=sup_rate_rain,
+                suppress_range_min_in_high_stage=sup_min_stage,
+                use_covariates_for_correction=use_cov,
+            )
+
+    # ----- Run button ---------------------------------------------------------
+
+    st.subheader("4. Run QC")
+
+    if st.button("🚀 Run QC checks", type="primary", use_container_width=True):
+        if not param_cols:
+            st.error("Pick at least one parameter to QC.")
+            st.stop()
+
+        with st.spinner("Running QC engine in the background..."):
+            qc = WaterQualityQCv2(
+                data=data,
+                timestamp_col=ts_col,
+                parameters=param_cols,
+                configs=custom_configs,
+                rainfall_col=rainfall_col,
+                stage_col=stage_col,
+                rain_window_hr=rain_window_hr,
+                rain_event_threshold=rain_event_threshold,
+                stage_high_quantile=stage_high_quantile,
+            )
+            qc.run_all_sequential()
+            qc.correct_all()
+            st.session_state.qc = qc
+        st.success("✅ QC + correction complete")
+
+        # Event summary
+        if rainfall_col or stage_col:
+            ev_msg = []
+            if rainfall_col:
+                ev_msg.append(
+                    f"{int(qc.rain_event.sum())} samples in rain events "
+                    f"({100*qc.rain_event.mean():.1f}%)"
+                )
+            if stage_col:
+                ev_msg.append(
+                    f"{int(qc.high_stage.sum())} samples in high stage "
+                    f"({100*qc.high_stage.mean():.1f}%)"
+                )
+            st.info("**Hydrologic events detected:** " + "  •  ".join(ev_msg))
+
+    # ----- Results -------------------------------------------------------------
+
+    if st.session_state.qc is not None:
+        qc = st.session_state.qc
+
+        st.subheader("5. Results")
+
+        # Summary table
+        summary = qc.summary()
+        st.dataframe(summary, use_container_width=True, hide_index=True)
+
+        # Headline metrics
+        cols = st.columns(len(summary))
+        for col, (_, row) in zip(cols, summary.iterrows()):
+            col.metric(
+                label=row["parameter"],
+                value=f"{row['any']:,} flagged",
+                delta=f"{row['pct_flagged']}% of {row['n_records']:,}",
+                delta_color="off",
+            )
+
+        # Per-parameter plots
+        st.markdown("#### Plots — flagged points highlighted, events shaded")
+        for p in qc.parameters:
+            if p not in qc.flags:
+                continue
+            flags = qc.flags[p]
+            series = qc.data[p]
+            ts = qc.data[ts_col]
+
+            fig, ax = plt.subplots(figsize=(12, 3.2))
+
+            # Shade rain-event and high-stage periods
+            if rainfall_col:
+                ax.fill_between(
+                    ts, series.min(), series.max(),
+                    where=qc.rain_event.values, alpha=0.10, color="steelblue",
+                    step="mid", label="rain event", linewidth=0,
+                )
+            if stage_col:
+                ax.fill_between(
+                    ts, series.min(), series.max(),
+                    where=qc.high_stage.values, alpha=0.10, color="goldenrod",
+                    step="mid", label="high stage", linewidth=0,
+                )
+
+            # Raw and corrected
+            ax.plot(ts, series, lw=0.7, color="#1f77b4", label="raw")
+            if p in qc.corrected:
+                ax.plot(
+                    ts, qc.corrected[p],
+                    lw=0.7, color="#2ca02c", alpha=0.7, label="corrected",
+                )
+
+            # Flagged points
+            flagged_mask = flags["any"]
+            if flagged_mask.any():
+                ax.scatter(
+                    ts[flagged_mask], series[flagged_mask],
+                    color="red", s=14, label="flagged", zorder=3,
+                )
+
+            # Suppressed-by-events points (rendered as hollow circles)
+            if "suppressed" in flags.columns and flags["suppressed"].any():
+                sup_mask = flags["suppressed"]
+                ax.scatter(
+                    ts[sup_mask], series[sup_mask],
+                    facecolors="none", edgecolors="orange", s=18,
+                    label="suppressed (real event)", zorder=2,
+                )
+
+            ax.set_title(f"{p} ({qc.configs[p].units})")
+            ax.set_xlabel("")
+            ax.legend(loc="upper right", fontsize=8, ncol=2)
+            ax.grid(alpha=0.3)
+            st.pyplot(fig)
+            plt.close(fig)
+
+        # ----- Downloads ------------------------------------------------------
+
+        st.subheader("6. Download results")
+
+        # Build everything in-memory for download
+        csv_buf = io.BytesIO()
+        out_df = qc.data.copy()
+        for p, f in qc.flags.items():
+            for col in ["range", "spike", "persistence", "rate_of_change",
+                        "arima", "any", "suppressed"]:
+                if col in f.columns:
+                    out_df[f"{p}_flag_{col}"] = f[col].values
+            if p in qc.corrected:
+                out_df[f"{p}_corrected"] = qc.corrected[p].values
+        out_df.to_csv(csv_buf, index=False)
+
+        # Build summary text
+        summary_text_lines = [
             "WATER QUALITY QC SUMMARY REPORT",
             "=" * 40,
             f"Generated: {pd.Timestamp.now():%Y-%m-%d %H:%M:%S}",
-            f"Total records: {len(self.data):,}",
-            f"Date range: {self.data[self.timestamp_col].min()} "
-            f"to {self.data[self.timestamp_col].max()}",
+            f"Total records: {len(qc.data):,}",
+            "",
         ]
-        if self.rainfall_col:
-            lines.append(
-                f"Rainfall covariate: '{self.rainfall_col}'  "
-                f"(rain events: {int(self.rain_event.sum())} samples, "
-                f"{round(100*self.rain_event.mean(),1)}%)"
-            )
-        if self.stage_col:
-            lines.append(
-                f"Stage covariate: '{self.stage_col}'  "
-                f"(high-stage events: {int(self.high_stage.sum())} samples, "
-                f"{round(100*self.high_stage.mean(),1)}%)"
-            )
-        lines.append("")
-        for _, r in s.iterrows():
-            lines += [
+        for _, r in summary.iterrows():
+            summary_text_lines += [
                 f"{r['parameter'].upper()} ({r['units']})",
                 f"  Total anomalies: {r['any']} ({r['pct_flagged']}%)",
-                f"  Suppressed by events: {r['suppressed_by_events']}",
-                f"  Detection breakdown:",
                 f"    - range:          {r['range']}",
                 f"    - spike:          {r['spike']}",
                 f"    - persistence:    {r['persistence']}",
@@ -504,452 +924,509 @@ class WaterQualityQCv2:
                 f"    - arima:          {r['arima']}",
                 "",
             ]
-        path.write_text("\n".join(lines))
-        return path
+        summary_text = "\n".join(summary_text_lines)
 
-    def export_flagged_csv(self, path: str | Path) -> Path:
-        path = Path(path)
-        out = self.data.copy()
-        for p, f in self.flags.items():
-            for col in ["range", "spike", "persistence", "rate_of_change",
-                        "arima", "any", "suppressed"]:
-                if col in f.columns:
-                    out[f"{p}_flag_{col}"] = f[col].values
-            if p in self.corrected:
-                out[f"{p}_corrected"] = self.corrected[p].values
-        out.to_csv(path, index=False)
-        return path
+        # Zip everything
+        zip_buf = io.BytesIO()
+        with zipfile.ZipFile(zip_buf, "w", zipfile.ZIP_DEFLATED) as z:
+            z.writestr("flagged_data.csv", csv_buf.getvalue())
+            z.writestr("summary_report.txt", summary_text)
 
-
-# ---------------------------------------------------------------------------
-# Demo data generator (used by the Streamlit app's "Try demo data" button)
-# ---------------------------------------------------------------------------
-
-# ---------------------------------------------------------------------------
-# Multi-file timestamp alignment
-# ---------------------------------------------------------------------------
-
-def detect_timestamp_column(df: pd.DataFrame) -> Optional[str]:
-    """Best-effort: pick the column that looks most like a timestamp.
-
-    Strategy:
-      1. Column names containing 'time', 'date', 'datetime', 'stamp'
-      2. Fall back to first column whose values parse as datetimes
-    """
-    name_hints = ("datetime", "timestamp", "time", "date")
-    for c in df.columns:
-        cl = c.lower()
-        if any(h in cl for h in name_hints):
-            try:
-                pd.to_datetime(df[c].head(50), errors="raise")
-                return c
-            except Exception:
-                continue
-    # Fallback: try each column
-    for c in df.columns:
-        try:
-            parsed = pd.to_datetime(df[c].head(50), errors="raise")
-            if parsed.notna().all():
-                return c
-        except Exception:
-            continue
-    return None
+        c1, c2, c3 = st.columns(3)
+        c1.download_button(
+            "⬇️ Flagged CSV", data=csv_buf.getvalue(),
+            file_name="flagged_data.csv", mime="text/csv",
+            use_container_width=True,
+        )
+        c2.download_button(
+            "⬇️ Summary report", data=summary_text,
+            file_name="summary_report.txt", mime="text/plain",
+            use_container_width=True,
+        )
+        c3.download_button(
+            "⬇️ All results (zip)", data=zip_buf.getvalue(),
+            file_name="qc_results.zip", mime="application/zip",
+            use_container_width=True,
+        )
 
 
-def align_to_grid(
-    target: pd.DataFrame,
-    target_ts_col: str,
-    external: pd.DataFrame,
-    external_ts_col: str,
-    value_cols: list[str],
-    tolerance_minutes: float = 10.0,
-) -> tuple[pd.DataFrame, dict]:
-    """Align external (rainfall or stage) data to the target timestamp grid.
+# ===========================================================================
+# LSTM TRAINING TAB
+# ===========================================================================
 
-    For each row in `target`, find the nearest external observation within
-    `tolerance_minutes`. Points outside tolerance become NaN.
+with tab_train:
+    _backend_label = {
+        "sklearn": "🌳 Gradient Boosting",
+        "tensorflow_lstm": "🧠 LSTM",
+    }.get(_ML_BACKEND, "ML")
+    st.subheader(f"Train a {_backend_label} model per parameter (PyHydroQC-style)")
 
-    For rainfall (typically a *rate* measured at points), this gives the
-    nearest sample. For cumulative rainfall, the caller should difference
-    first.
-
-    Returns:
-        merged: copy of `target` with the external value columns appended
-        diag:   dict with alignment quality metrics
-    """
-    t = target[[target_ts_col]].copy()
-    t[target_ts_col] = pd.to_datetime(t[target_ts_col], errors="coerce")
-    # merge_asof requires non-null keys; drop rows with bad timestamps
-    t_valid = t.dropna(subset=[target_ts_col]).sort_values(target_ts_col).reset_index()
-    t_valid = t_valid.rename(columns={"index": "_orig_idx"})
-
-    e = external.copy()
-    e[external_ts_col] = pd.to_datetime(e[external_ts_col], errors="coerce")
-    e = e.dropna(subset=[external_ts_col])
-    keep = [external_ts_col] + value_cols
-    e = e[keep].sort_values(external_ts_col).reset_index(drop=True)
-
-    # merge_asof does nearest-neighbor with a tolerance
-    merged_valid = pd.merge_asof(
-        t_valid, e,
-        left_on=target_ts_col, right_on=external_ts_col,
-        direction="nearest",
-        tolerance=pd.Timedelta(minutes=tolerance_minutes),
-    )
-
-    # Build the full-length result, putting NaN for rows whose target timestamp was bad
-    full = target.copy()
-    full[target_ts_col] = pd.to_datetime(full[target_ts_col], errors="coerce")
-    full = full.sort_values(target_ts_col).reset_index(drop=True)
-    for vc in value_cols:
-        col = pd.Series(np.nan, index=full.index, dtype="float64")
-        # Coerce incoming values to numeric — Pandas 2.2+ refuses to silently
-        # cast strings/mixed types into a float64 Series. This handles columns
-        # the user uploaded as quoted numbers, with blanks, or with stray text.
-        values_numeric = pd.to_numeric(
-            merged_valid[vc], errors="coerce"
-        ).to_numpy()
-        col.iloc[merged_valid["_orig_idx"].values] = values_numeric
-        full[vc] = col.values
-
-    # Diagnostics
-    diag = {
-        "target_rows": len(full),
-        "target_rows_valid_ts": len(t_valid),
-        "external_rows": len(e),
-        "tolerance_min": tolerance_minutes,
-    }
-    for vc in value_cols:
-        matched = full[vc].notna().sum()
-        diag[f"{vc}_matched"] = int(matched)
-        diag[f"{vc}_match_pct"] = round(100 * matched / len(full), 1) if len(full) else 0
-
-    return full, diag
-
-
-# ---------------------------------------------------------------------------
-# Mixed-cadence detection and resampling
-# ---------------------------------------------------------------------------
-
-def detect_column_cadences(
-    df: pd.DataFrame,
-    timestamp_col: str,
-) -> pd.DataFrame:
-    """For each numeric column, estimate its native sampling cadence.
-
-    Many Campbell-logger and similar exports interleave columns at different
-    cadences (e.g. rain at 5-min, sonde at 15-min) in the same CSV, with NaN
-    elsewhere. This helper returns a per-column report.
-
-    Returns a DataFrame with one row per non-timestamp column:
-        column, n_total, n_non_null, pct_non_null,
-        median_interval_min, mode_interval_min,
-        cadence_status ('regular' | 'sparse' | 'irregular')
-    """
-    ts = pd.to_datetime(df[timestamp_col], errors="coerce")
-    out_rows = []
-    for col in df.columns:
-        if col == timestamp_col:
-            continue
-        s = pd.to_numeric(df[col], errors="coerce")
-        valid = s.notna() & ts.notna()
-        n_valid = int(valid.sum())
-        n_total = len(s)
-        if n_valid < 3:
-            out_rows.append({
-                "column": col,
-                "n_total": n_total,
-                "n_non_null": n_valid,
-                "pct_non_null": round(100 * n_valid / max(n_total, 1), 1),
-                "median_interval_min": None,
-                "mode_interval_min": None,
-                "cadence_status": "too few samples",
-            })
-            continue
-        ts_valid = ts[valid].sort_values()
-        deltas = ts_valid.diff().dt.total_seconds().dropna() / 60.0
-        med = float(deltas.median())
-        mod = float(deltas.mode().iloc[0]) if not deltas.mode().empty else med
-        # 'regular' if mode == median (within 10%); 'sparse' if values are a subset of the master grid;
-        # 'irregular' otherwise
-        if abs(med - mod) / max(med, 1e-9) < 0.1:
-            status = "regular"
-        else:
-            status = "irregular"
-        out_rows.append({
-            "column": col,
-            "n_total": n_total,
-            "n_non_null": n_valid,
-            "pct_non_null": round(100 * n_valid / max(n_total, 1), 1),
-            "median_interval_min": round(med, 2),
-            "mode_interval_min": round(mod, 2),
-            "cadence_status": status,
-        })
-    return pd.DataFrame(out_rows)
-
-
-def needs_resampling(cadence_report: pd.DataFrame, tolerance_pct: float = 5.0) -> bool:
-    """True if columns appear to be on different cadences.
-
-    Specifically: if column cadences span >tolerance_pct difference in their
-    mode interval, the file is mixed-cadence and should be resampled.
-    """
-    valid = cadence_report.dropna(subset=["mode_interval_min"])
-    if len(valid) < 2:
-        return False
-    modes = valid["mode_interval_min"].astype(float)
-    if modes.min() == 0:
-        return False
-    span = (modes.max() - modes.min()) / modes.min() * 100
-    return span > tolerance_pct
-
-
-def resample_to_grid(
-    df: pd.DataFrame,
-    timestamp_col: str,
-    target_interval_minutes: float,
-    rainfall_cols: Optional[list[str]] = None,
-) -> tuple[pd.DataFrame, dict]:
-    """Regrid every column to a uniform `target_interval_minutes` grid.
-
-    For most columns: nearest-neighbor within a half-window tolerance.
-    For rainfall columns (incremental accumulation): SUM within each bin.
-
-    Returns:
-        regridded: new dataframe on the uniform grid
-        diag:      dict with diagnostics per column (samples matched, etc.)
-    """
-    rainfall_cols = rainfall_cols or []
-    df = df.copy()
-    df[timestamp_col] = pd.to_datetime(df[timestamp_col], errors="coerce")
-    df = df.dropna(subset=[timestamp_col]).sort_values(timestamp_col)
-
-    t_start = df[timestamp_col].min().floor(f"{int(target_interval_minutes)}min")
-    t_end = df[timestamp_col].max().ceil(f"{int(target_interval_minutes)}min")
-    grid = pd.date_range(t_start, t_end, freq=f"{int(target_interval_minutes)}min")
-
-    out = pd.DataFrame({timestamp_col: grid})
-    diag = {"target_interval_min": target_interval_minutes, "n_target_rows": len(grid)}
-
-    half_window = pd.Timedelta(minutes=target_interval_minutes / 2)
-
-    for col in df.columns:
-        if col == timestamp_col:
-            continue
-        sub = df[[timestamp_col, col]].dropna(subset=[col])
-        if len(sub) == 0:
-            out[col] = np.nan
-            diag[col] = {"n_source": 0, "n_matched": 0}
-            continue
-
-        if col in rainfall_cols:
-            # Sum into bins of target_interval_minutes
-            sub_indexed = sub.set_index(timestamp_col)
-            sub_indexed[col] = pd.to_numeric(sub_indexed[col], errors="coerce")
-            binned = sub_indexed[col].resample(
-                f"{int(target_interval_minutes)}min",
-                label="left", closed="left",
-            ).sum()
-            # Reindex to our grid (this drops the right edge if needed)
-            binned = binned.reindex(grid, fill_value=0.0)
-            out[col] = binned.values
-            diag[col] = {"n_source": len(sub), "n_matched": int((binned > 0).sum()), "method": "sum"}
-        else:
-            # Nearest-neighbor merge
-            sub[col] = pd.to_numeric(sub[col], errors="coerce")
-            merged = pd.merge_asof(
-                out[[timestamp_col]], sub,
-                on=timestamp_col, direction="nearest",
-                tolerance=half_window,
-            )
-            out[col] = merged[col].values
-            diag[col] = {
-                "n_source": len(sub),
-                "n_matched": int(merged[col].notna().sum()),
-                "method": "nearest",
-            }
-
-    return out, diag
-
-
-# ---------------------------------------------------------------------------
-# AQUARIUS-style header detection
-# ---------------------------------------------------------------------------
-
-def detect_csv_header_row(uploaded_or_path, max_scan: int = 50) -> int:
-    """For AQUARIUS, Campbell, or other instrument exports with metadata at
-    the top of the file, find the row index containing actual column headers.
-
-    Heuristics, in order of preference:
-      1. Skip lines starting with '#' (AQUARIUS comments).
-      2. Skip lines whose first non-blank cell is "Id", "id", or a UUID.
-      3. Skip "Units" rows.
-      4. Pick a row where (a) at least 3 cells are non-blank,
-         (b) the first cell is a string that looks like a column name
-         (alphabetic, contains words like 'time', 'date', 'stamp'), and
-         (c) no cells are pure numbers.
-
-    Returns the 0-based row index to pass as `skiprows` to pandas.
-    """
-    # Accept either a file-like or a path
-    if hasattr(uploaded_or_path, "seek"):
-        uploaded_or_path.seek(0)
-        text = uploaded_or_path.read()
-        if isinstance(text, bytes):
-            for enc in ("utf-8", "utf-8-sig", "cp1252", "latin-1", "utf-16"):
-                try:
-                    text = text.decode(enc)
-                    break
-                except UnicodeDecodeError:
-                    continue
-            else:
-                text = text.decode("utf-8", errors="replace")
-        uploaded_or_path.seek(0)
-        lines = text.splitlines()[:max_scan]
+    if not _ML_AVAILABLE:
+        st.error(
+            "**No ML backend installed.** The Train tab needs either "
+            "**scikit-learn** (recommended, light) or **TensorFlow** (heavier, "
+            "more powerful).\n\n"
+            "**Easiest fix — install scikit-learn:**\n"
+            "```\npip install scikit-learn\n```\n"
+            "This works on any Python 3.9+ and runs fast on CPU.\n\n"
+            "**Alternative — TensorFlow LSTM (heavier):**\n"
+            "```\npip install -r requirements-lstm.txt\nexport WQC_USE_LSTM=1\n```\n"
+            "Needs Python 3.10–3.12. On Streamlit Cloud, pick Python 3.11 "
+            "in Advanced settings at deploy time.\n\n"
+            f"Detail: `{_ML_BACKEND_ERROR}`"
+        )
     else:
-        with open(uploaded_or_path, "rb") as f:
-            data = f.read(50_000)
-        for enc in ("utf-8", "utf-8-sig", "cp1252", "latin-1", "utf-16"):
-            try:
-                text = data.decode(enc)
-                break
-            except UnicodeDecodeError:
-                continue
+        if _ML_BACKEND == "sklearn":
+            st.caption(
+                "Using **scikit-learn HistGradientBoosting** — fast (seconds), "
+                "lightweight, installs anywhere. Trains a **forecast** model "
+                "(predicts next clean value from past + covariates → residuals "
+                "flag anomalies) and a **correction** model (maps raw windows "
+                "to clean values → fills flagged gaps). Saved models reuse "
+                "without retraining."
+            )
         else:
-            text = data.decode("utf-8", errors="replace")
-        lines = text.splitlines()[:max_scan]
+            st.caption(
+                "Using **TensorFlow LSTM**. Trains a **forecast** model "
+                "(predicts next clean value from past + covariates → residuals "
+                "flag anomalies) and a **correction** model (maps raw windows "
+                "to clean values → fills flagged gaps). Saved models reuse "
+                "without retraining."
+            )
 
-    import re
-    uuid_re = re.compile(r"^[0-9a-f]{24,}$", re.IGNORECASE)  # mongo-id-like or longer
-    timestamp_hints = ("time", "stamp", "date", "datetime")
+        st.markdown("**Step 1.** Upload your *clean* (corrected) dataset. "
+                    "Timestamps must match the raw data already loaded above.")
 
-    candidates = []  # (row_idx, score)
+        clean_file = st.file_uploader(
+            "Clean / corrected CSV",
+            type=["csv", "xlsx", "xls"], key="clean_upload_train",
+        )
 
-    for i, line in enumerate(lines):
-        line = line.strip().lstrip("\ufeff")
-        if not line or line.startswith("#"):
-            continue
-        cells = [c.strip().strip('"').strip("'") for c in line.split(",")]
-        non_blank = [c for c in cells if c]
-        if len(non_blank) < 3:
-            continue
-        first = non_blank[0]
-
-        # Reject if first cell looks like a number
-        try:
-            float(first)
-            continue
-        except ValueError:
-            pass
-
-        # Reject if all cells (after the first) look like UUIDs - this is
-        # the "Id" row in Campbell-style exports
-        rest = non_blank[1:]
-        uuid_share = sum(1 for c in rest if uuid_re.match(c)) / max(len(rest), 1)
-        if uuid_share > 0.5:
-            continue
-
-        # Reject obvious "Units" rows: first cell is exactly "Units" or "Unit"
-        if first.lower() in ("units", "unit"):
-            continue
-
-        # Score: prefer rows where the first cell contains a timestamp hint
-        score = 0
-        if any(h in first.lower() for h in timestamp_hints):
-            score += 10
-        # Prefer rows with more non-blank cells
-        score += len(non_blank)
-        # Prefer rows whose cells look like names (alphabetic-ish, not data)
-        alphaish = sum(1 for c in non_blank if any(ch.isalpha() for ch in c))
-        score += alphaish
-
-        candidates.append((i, score))
-
-    if not candidates:
-        return 0
-
-    # Best score wins; ties broken by lowest row index
-    candidates.sort(key=lambda x: (-x[1], x[0]))
-    return candidates[0][0]
-
-
-def generate_demo_data(n: int = 5000, seed: int = 42) -> pd.DataFrame:
-    """Synthetic Fahrenheit water-quality time series with rainfall + stage.
-
-    Includes:
-      - Diurnal cycles on temp, DO, pH, SpC, turbidity
-      - Two simulated rain events (rainfall + stage rise + turbidity spike +
-        SpC dilution + pH drop) — these are REAL responses and should be
-        preserved by event-aware QC, not flagged.
-      - Injected sensor faults: extreme spikes, stuck sensors, out-of-range.
-    """
-    rng = np.random.default_rng(seed)
-    timestamps = pd.date_range("2024-01-01", periods=n, freq="15min")
-
-    t = np.arange(n)
-    daily = np.sin(2 * np.pi * t / (24 * 4))  # 96 samples/day
-
-    # Baseline series
-    temp = 59 + 9 * daily + rng.normal(0, 0.5, n)
-    spc = 450 + 30 * daily + rng.normal(0, 5, n)
-    ph = 7.5 + 0.3 * daily + rng.normal(0, 0.05, n)
-    do = 9.0 + 1.5 * daily + rng.normal(0, 0.2, n)
-    turb = 5.0 + 2 * daily + rng.normal(0, 0.5, n)
-
-    # ---- Rainfall + stage with two real storm events ----
-    rainfall = np.zeros(n)   # inches per 15-min step
-    stage = 2.5 + 0.05 * daily + rng.normal(0, 0.02, n)  # ft, gentle baseline
-
-    def storm(start: int, peak_in_per_step: float, duration: int):
-        # Triangular rainfall pulse
-        rise = duration // 3
-        for i in range(duration):
-            if i < rise:
-                rainfall[start + i] += peak_in_per_step * (i / rise)
-            else:
-                rainfall[start + i] += peak_in_per_step * max(
-                    0, 1 - (i - rise) / (duration - rise)
+        if clean_file is not None:
+            try:
+                clean_df, clean_note = read_csv_resilient(
+                    clean_file, "clean dataset"
                 )
-        # Stage rises ~lagging by 6 samples (90 min) and recedes slowly
-        lag = 6
-        for i in range(duration * 3):
-            idx = start + lag + i
-            if 0 <= idx < n:
-                rise_pct = min(1, i / (duration * 0.6))
-                fall = max(0, 1 - (i - duration * 0.6) / (duration * 2))
-                stage[idx] += 1.8 * rise_pct * fall
+                st.success(
+                    f"Loaded clean dataset: {len(clean_df):,} rows ({clean_note})."
+                )
+                clean_ts = detect_timestamp_column(clean_df)
+                if clean_ts is None:
+                    st.error("Couldn't auto-detect a timestamp column in the clean file.")
+                    st.stop()
+                clean_df[clean_ts] = pd.to_datetime(clean_df[clean_ts], errors="coerce")
+                # Drop rows where the timestamp couldn't be parsed
+                clean_df = clean_df.dropna(subset=[clean_ts])
+                # Drop any other columns that look like timestamps — common in
+                # AQUARIUS side-by-side Excel exports where each parameter has
+                # its own timestamp column. Leaving them in confuses training.
+                _ts_like_cols = []
+                for c in list(clean_df.columns):
+                    if c == clean_ts:
+                        continue
+                    sample = clean_df[c].dropna().head(20)
+                    if sample.empty:
+                        continue
+                    # Only string-typed columns can be misinterpreted as
+                    # timestamps. Numeric columns might accidentally parse as
+                    # epoch dates and we don't want to drop those.
+                    if not pd.api.types.is_object_dtype(sample) and \
+                       not pd.api.types.is_string_dtype(sample):
+                        continue
+                    try:
+                        parsed = pd.to_datetime(sample, errors="raise")
+                        if parsed.notna().all():
+                            _ts_like_cols.append(c)
+                    except (ValueError, TypeError):
+                        pass
+                if _ts_like_cols:
+                    clean_df = clean_df.drop(columns=_ts_like_cols)
+                    st.caption(
+                        f"ℹ️ Dropped {len(_ts_like_cols)} extra timestamp-like "
+                        f"column(s) from the clean file: "
+                        f"{', '.join(repr(c) for c in _ts_like_cols)}"
+                    )
 
-    storm(start=int(n * 0.16), peak_in_per_step=0.08, duration=40)   # ~10 hr event
-    storm(start=int(n * 0.44), peak_in_per_step=0.05, duration=30)   # ~7.5 hr event
+                # Align clean to raw timestamps (should be identical, but in case)
+                clean_df = clean_df.set_index(clean_ts).reindex(
+                    pd.to_datetime(data[ts_col]).values, method="nearest"
+                ).reset_index(drop=True)
 
-    # ---- Real WQ responses to storms (NOT anomalies) ----
-    rain_roll = pd.Series(rainfall).rolling(12, min_periods=1).sum().values
-    stage_anomaly = stage - (2.5 + 0.05 * daily)
-    # Turbidity spikes during storms
-    turb += 80 * np.clip(rain_roll, 0, 1.5) + 30 * np.clip(stage_anomaly, 0, 2)
-    # Specific conductivity dilutes
-    spc -= 120 * np.clip(rain_roll, 0, 1.5)
-    # pH dips slightly with acidic runoff
-    ph -= 0.4 * np.clip(rain_roll, 0, 1.5)
-    # DO drops during high-stage (organic load, mixing of anoxic water)
-    do -= 2.0 * np.clip(stage_anomaly, 0, 2)
+                st.markdown("**Step 2.** Pick parameter(s) to train.")
+                trainable = [
+                    c for c in param_cols
+                    if c in clean_df.columns and c in data.columns
+                ]
+                with st.expander("ℹ️ Clean dataset diagnostics", expanded=False):
+                    st.write(
+                        f"- Clean file columns after parsing: "
+                        f"`{', '.join(clean_df.columns[:20])}`"
+                        + (f" ... ({len(clean_df.columns)} total)"
+                           if len(clean_df.columns) > 20 else "")
+                    )
+                    st.write(f"- Raw parameter columns (from rules tab): `{param_cols}`")
+                    st.write(f"- **Trainable** (intersection): `{trainable}`")
+                if not trainable:
+                    st.warning(
+                        "No matching parameter columns between raw and clean data. "
+                        f"Raw has: {param_cols}. Clean has: {list(clean_df.columns)}"
+                    )
+                    st.stop()
 
-    df = pd.DataFrame({
-        "datetime": timestamps,
-        "temperature": temp,
-        "specific_conductivity": spc,
-        "ph": ph,
-        "dissolved_oxygen": do,
-        "turbidity": turb,
-        "rainfall": rainfall,
-        "stage": stage,
-    })
+                params_to_train = st.multiselect(
+                    "Parameters to train",
+                    options=trainable, default=trainable,
+                )
 
-    # Inject obvious sensor faults (these SHOULD be flagged)
-    df.loc[500, "temperature"] = 122            # extreme spike
-    df.loc[1500:1530, "temperature"] = 70       # stuck sensor
-    df.loc[2500, "ph"] = 12.5                   # out of range
-    df.loc[3000, "dissolved_oxygen"] = -1       # negative DO
-    df.loc[4500, "turbidity"] = 1500            # impossible turbidity spike OUTSIDE storm
+                st.markdown("**Step 3.** Training settings.")
+                t1, t2, t3, t4 = st.columns(4)
+                with t1:
+                    window_size = st.number_input(
+                        "Window size (samples of history)",
+                        min_value=8, max_value=512, value=96, step=8,
+                        help="96 samples = 24 hours at 15-min sampling",
+                    )
+                with t2:
+                    if _ML_BACKEND == "sklearn":
+                        iterations_label = "Max iterations"
+                        iterations_default = 200
+                        iterations_help = ("Gradient-boosting iterations. Training "
+                                           "auto-stops earlier if validation loss plateaus.")
+                    else:
+                        iterations_label = "Epochs"
+                        iterations_default = 50
+                        iterations_help = "Number of training passes over the data."
+                    iterations = st.number_input(
+                        iterations_label,
+                        min_value=5, max_value=500,
+                        value=iterations_default, step=5,
+                        help=iterations_help,
+                    )
+                with t3:
+                    if _ML_BACKEND == "sklearn":
+                        # Tree depth controls model capacity for gradient boosting
+                        capacity = st.number_input(
+                            "Tree max depth",
+                            min_value=2, max_value=12, value=6, step=1,
+                            help="Controls model capacity. 6 is a good default.",
+                        )
+                    else:
+                        capacity = st.number_input(
+                            "LSTM units / layer",
+                            min_value=8, max_value=256, value=64, step=8,
+                        )
+                with t4:
+                    threshold_k = st.number_input(
+                        "Anomaly threshold k (mean+k*std)",
+                        min_value=1.0, max_value=10.0, value=4.0, step=0.5,
+                    )
 
-    return df
+                use_covars_in_lstm = st.checkbox(
+                    "Include rainfall + stage as features",
+                    value=(rainfall_col is not None or stage_col is not None),
+                    disabled=(rainfall_col is None and stage_col is None),
+                )
+
+                model_dir = st.text_input(
+                    "Save models to folder",
+                    value="./models",
+                    help="One subfolder per parameter will be created here.",
+                )
+
+                if st.button("🚂 Train models", type="primary",
+                             use_container_width=True):
+                    if not params_to_train:
+                        st.error("Pick at least one parameter.")
+                        st.stop()
+
+                    # Build covariate frame, ensuring everything is numeric
+                    if use_covars_in_lstm:
+                        cov_cols = [c for c in [rainfall_col, stage_col] if c is not None]
+                        if cov_cols:
+                            covar_df = data[cov_cols].copy()
+                            for c in cov_cols:
+                                covar_df[c] = pd.to_numeric(
+                                    covar_df[c], errors="coerce"
+                                )
+                        else:
+                            covar_df = None
+                    else:
+                        covar_df = None
+
+                    progress = st.progress(0.0, text="Starting...")
+                    status = st.empty()
+
+                    trained = {}
+                    skipped = []
+                    for i, p in enumerate(params_to_train):
+                        # Coerce both raw and clean series to numeric. Strings
+                        # that don't parse (timestamps, blanks, "NA") become NaN.
+                        clean_series = pd.to_numeric(
+                            clean_df[p].reset_index(drop=True), errors="coerce"
+                        )
+                        raw_series = pd.to_numeric(
+                            data[p].reset_index(drop=True), errors="coerce"
+                        )
+                        if clean_series.notna().sum() < 100 or raw_series.notna().sum() < 100:
+                            skipped.append(
+                                f"`{p}`: too few numeric values "
+                                f"(clean={int(clean_series.notna().sum())}, "
+                                f"raw={int(raw_series.notna().sum())}). "
+                                "Likely a non-numeric column was selected."
+                            )
+                            continue
+                        tol = DEFAULT_LABEL_TOLERANCES.get(p, 0.0)
+
+                        # Build a config using only fields the active backend supports.
+                        # Both LearnedConfig and LSTMConfig share these core fields:
+                        common_kwargs = dict(
+                            parameter=p,
+                            window_size=int(window_size),
+                            threshold_k=float(threshold_k),
+                            label_tolerance=float(tol),
+                        )
+                        if _ML_BACKEND == "sklearn":
+                            cfg = ParameterConfig_ML(
+                                max_iter=int(iterations),
+                                max_depth=int(capacity),
+                                **common_kwargs,
+                            )
+                        else:
+                            cfg = ParameterConfig_ML(
+                                epochs=int(iterations),
+                                lstm_units=int(capacity),
+                                **common_kwargs,
+                            )
+
+                        def cb(phase, ep, total, logs):
+                            overall = (
+                                i + (0.5 if phase == "correction" else 0.0)
+                                + (ep / total) * 0.5
+                            ) / len(params_to_train)
+                            progress.progress(
+                                overall,
+                                text=f"{p} [{phase}] epoch {ep}/{total}  "
+                                     f"loss={logs.get('loss', 0):.4f}",
+                            )
+
+                        status.info(f"Training {p}...")
+                        lstm = ParameterModel(cfg)
+                        lstm.fit(
+                            clean=clean_series, raw=raw_series,
+                            covariates=covar_df,
+                            progress_callback=cb,
+                        )
+                        save_path = Path(model_dir) / p
+                        lstm.save(save_path)
+                        trained[p] = str(save_path)
+
+                    progress.progress(1.0, text="Done.")
+                    status.success(
+                        f"✅ Trained {len(trained)} model(s). "
+                        f"Saved to `{model_dir}`."
+                    )
+                    if skipped:
+                        st.warning(
+                            "⚠️ Some parameters were skipped:\n\n- "
+                            + "\n- ".join(skipped)
+                        )
+                    st.session_state.trained_models = trained
+                    st.session_state.lstm_clean_df = clean_df
+
+                    # Show loss curves
+                    st.markdown("#### Training history")
+                    _x_label = "iteration" if _ML_BACKEND == "sklearn" else "epoch"
+                    _y_label = "score" if _ML_BACKEND == "sklearn" else "MSE loss"
+                    for p, path in trained.items():
+                        lstm = ParameterModel.load(path)
+                        fig, ax = plt.subplots(figsize=(10, 2.5))
+                        hist = lstm.history.get("forecast")
+                        if hist:
+                            ax.plot(hist["loss"], label="forecast train", lw=1)
+                            if hist["val_loss"]:
+                                ax.plot(hist["val_loss"], label="forecast val",
+                                        lw=1, ls="--")
+                        hist_c = lstm.history.get("correction")
+                        if hist_c:
+                            ax.plot(hist_c["loss"], label="correction train",
+                                    lw=1, color="darkgreen")
+                            if hist_c["val_loss"]:
+                                ax.plot(hist_c["val_loss"], label="correction val",
+                                        lw=1, ls="--", color="darkgreen")
+                        ax.set_title(f"{p} — training history")
+                        ax.set_xlabel(_x_label)
+                        ax.set_ylabel(_y_label)
+                        ax.legend(fontsize=8)
+                        ax.grid(alpha=0.3)
+                        st.pyplot(fig)
+                        plt.close(fig)
+
+            except Exception as e:
+                st.error(f"Couldn't read or process the clean dataset: {e}")
+
+
+# ===========================================================================
+# LSTM DETECT & VALIDATE TAB
+# ===========================================================================
+
+with tab_lstm:
+    _backend_label2 = {
+        "sklearn": "Gradient Boosting",
+        "tensorflow_lstm": "LSTM",
+    }.get(_ML_BACKEND, "trained")
+    st.subheader(f"Run a trained {_backend_label2} model on the raw data")
+
+    if not _ML_AVAILABLE:
+        st.error("No ML backend installed — see the Train tab for setup options.")
+    else:
+        st.caption(
+            f"Apply trained {_backend_label2} models to flag anomalies and "
+            "(optionally) correct flagged points. If you also have clean reference "
+            "data loaded in the Train tab, you'll see precision / recall / F1 metrics."
+        )
+
+        model_root = st.text_input(
+            "Folder containing trained models",
+            value="./models",
+            key="lstm_detect_root",
+        )
+
+        if Path(model_root).exists():
+            available = [d.name for d in Path(model_root).iterdir() if d.is_dir()
+                         and (d / "meta.json").exists()]
+        else:
+            available = []
+
+        if not available:
+            st.info(
+                f"No trained models found in `{model_root}`. Train some in the "
+                "**Train LSTM** tab first."
+            )
+        else:
+            run_params = st.multiselect(
+                "Models to apply",
+                options=available,
+                default=[p for p in available if p in param_cols],
+            )
+
+            apply_correction = st.checkbox(
+                "Apply correction LSTM to flagged points", value=True,
+            )
+
+            if st.button("🔬 Run LSTM detection", type="primary",
+                         use_container_width=True):
+                if not run_params:
+                    st.error("Pick at least one model to apply.")
+                    st.stop()
+
+                # Build covariate frame matching what models expect
+                covar_df = None
+                cov_cols = [c for c in [rainfall_col, stage_col] if c is not None]
+                if cov_cols:
+                    covar_df = data[cov_cols].copy()
+
+                lstm_results = {}
+                metrics_table = []
+
+                for p in run_params:
+                    lstm = ParameterModel.load(Path(model_root) / p)
+                    raw_series = data[p].reset_index(drop=True)
+
+                    flags, residual, threshold = lstm.detect_anomalies(
+                        raw_series, covar_df,
+                    )
+                    corrected = None
+                    if apply_correction and lstm.correction_model is not None:
+                        corrected = lstm.correct(raw_series, covar_df)
+
+                    lstm_results[p] = {
+                        "flags": flags,
+                        "residual": residual,
+                        "threshold": threshold,
+                        "corrected": corrected,
+                        "model": lstm,
+                    }
+
+                    # Validation against clean data if available
+                    clean_df_state = st.session_state.get("lstm_clean_df")
+                    if clean_df_state is not None and p in clean_df_state.columns:
+                        truth = derive_labels(
+                            raw_series,
+                            clean_df_state[p].reset_index(drop=True),
+                            tolerance=lstm.config.label_tolerance,
+                        )
+                        m = compute_metrics(flags, truth)
+                        m["parameter"] = p
+                        metrics_table.append(m)
+
+                st.session_state.lstm_results = lstm_results
+
+                # ---- Plots
+                st.markdown("#### Detection plots")
+                ts = data[ts_col]
+                for p, r in lstm_results.items():
+                    fig, (ax1, ax2) = plt.subplots(
+                        2, 1, figsize=(12, 5), sharex=True,
+                        gridspec_kw={"height_ratios": [2, 1]},
+                    )
+
+                    raw_series = data[p]
+                    ax1.plot(ts, raw_series, lw=0.7, color="#1f77b4", label="raw")
+                    if r["corrected"] is not None:
+                        ax1.plot(ts, r["corrected"], lw=0.7, color="#2ca02c",
+                                 alpha=0.7, label="LSTM corrected")
+                    if r["flags"].any():
+                        mask = r["flags"]
+                        ax1.scatter(
+                            ts[mask], raw_series[mask],
+                            color="red", s=14, label="LSTM flagged", zorder=3,
+                        )
+                    ax1.set_title(f"{p}: LSTM detection")
+                    ax1.legend(fontsize=8, loc="upper right")
+                    ax1.grid(alpha=0.3)
+
+                    ax2.plot(ts, r["residual"], lw=0.6, color="grey",
+                             label="|residual|")
+                    ax2.plot(ts, r["threshold"], lw=0.8, color="red",
+                             label="dynamic threshold")
+                    ax2.set_ylabel("residual")
+                    ax2.legend(fontsize=8, loc="upper right")
+                    ax2.grid(alpha=0.3)
+
+                    st.pyplot(fig)
+                    plt.close(fig)
+
+                # ---- Metrics
+                if metrics_table:
+                    st.markdown("#### Validation metrics "
+                                "(vs. derived ground truth from clean data)")
+                    mdf = pd.DataFrame(metrics_table)
+                    cols_order = ["parameter", "precision", "recall", "f1",
+                                  "accuracy", "true_positives", "false_positives",
+                                  "false_negatives", "true_negatives"]
+                    mdf = mdf[[c for c in cols_order if c in mdf.columns]]
+                    st.dataframe(mdf, use_container_width=True, hide_index=True)
+                    st.caption(
+                        "Higher precision = fewer false alarms. "
+                        "Higher recall = fewer missed anomalies. "
+                        "F1 balances both."
+                    )
+
+                # ---- Download
+                st.markdown("#### Download LSTM results")
+                out_df = data.copy()
+                for p, r in lstm_results.items():
+                    out_df[f"{p}_lstm_flag"] = r["flags"].values
+                    out_df[f"{p}_lstm_residual"] = r["residual"].values
+                    if r["corrected"] is not None:
+                        out_df[f"{p}_lstm_corrected"] = r["corrected"].values
+
+                buf = io.BytesIO()
+                out_df.to_csv(buf, index=False)
+                st.download_button(
+                    "⬇️ LSTM-flagged + corrected CSV",
+                    data=buf.getvalue(),
+                    file_name="lstm_qc_results.csv",
+                    mime="text/csv",
+                    use_container_width=True,
+                )

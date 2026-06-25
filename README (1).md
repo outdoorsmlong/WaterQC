@@ -1,103 +1,138 @@
-{
-  "station_id": "KINA",
-  "station_name": "KIN_A — Cooper River tidal station",
-  "description": "87 days of 15-min data analyzed (Feb–May 2026). pH shows diurnal cycles; turbidity is bursty during storms; Spec Cond can flatline for days during stable conditions. Watch for -99999 sentinel values from the logger.",
-  "sampling_interval_minutes": 15,
-  "column_aliases": {
-    "timestamp": ["Timestamp (UTC-05:00)", "TimeStamp", "datetime", "time"],
-    "pH": ["pH", "pH@COLA_KINA"],
-    "temperature": ["Water Temp", "Water Temp@COLA_KINA", "Temperature"],
-    "turbidity": ["Turb", "Turbidity"],
-    "specific_conductivity": ["Spec Cond", "SpC"],
-    "dissolved_oxygen": ["O2", "O2 mg/L", "DO"],
-    "stage": ["Stage"],
-    "rainfall": ["Precip", "Precipitation", "Rainfall"]
-  },
-  "covariates": {
-    "rainfall_col_hint": "Precip",
-    "stage_col_hint": "Stage",
-    "rain_window_hr": 2.0,
-    "rain_event_threshold": 0.02,
-    "stage_high_quantile": 0.90
-  },
-  "parameters": {
-    "temperature": {
-      "units": "°F",
-      "range_min": 32,
-      "range_max": 90,
-      "spike_threshold": 5.0,
-      "persistence_window": 12,
-      "max_rate_change": 6.0,
-      "suppress_spike_in_rain": false,
-      "suppress_rate_in_rain": false,
-      "suppress_range_min_in_high_stage": false,
-      "use_covariates_for_correction": false
-    },
-    "specific_conductivity": {
-      "units": "mS/cm",
-      "range_min": 0.0,
-      "range_max": 0.5,
-      "spike_threshold": 4.0,
-      "persistence_window": 384,
-      "max_rate_change": 0.2,
-      "suppress_spike_in_rain": false,
-      "suppress_rate_in_rain": true,
-      "suppress_range_min_in_high_stage": false,
-      "use_covariates_for_correction": true,
-      "notes": "Persistence window set to 384 samples (96 hr / 4 days) because this sensor frequently flatlines for 1-3 days at a time. Shorter windows flag 30-60% of the dataset. Investigate sensor maintenance separately. Watch for -99999 logger sentinel — range_min catches it."
-    },
-    "pH": {
-      "units": "pH",
-      "range_min": 6.0,
-      "range_max": 9.0,
-      "spike_threshold": 4.0,
-      "persistence_window": 12,
-      "max_rate_change": 0.6,
-      "suppress_spike_in_rain": false,
-      "suppress_rate_in_rain": true,
-      "suppress_range_min_in_high_stage": false,
-      "use_covariates_for_correction": true,
-      "notes": "Technician corrections smooth diurnal cycles. Rules-based engine preserves them."
-    },
-    "dissolved_oxygen": {
-      "units": "mg/L",
-      "range_min": 0.0,
-      "range_max": 15.0,
-      "spike_threshold": 5.0,
-      "persistence_window": 12,
-      "max_rate_change": 7.0,
-      "suppress_spike_in_rain": false,
-      "suppress_rate_in_rain": true,
-      "suppress_range_min_in_high_stage": true,
-      "use_covariates_for_correction": true
-    },
-    "turbidity": {
-      "units": "FNU",
-      "range_min": 0.0,
-      "range_max": 1000.0,
-      "spike_threshold": 6.0,
-      "persistence_window": 12,
-      "max_rate_change": 300.0,
-      "suppress_spike_in_rain": true,
-      "suppress_rate_in_rain": true,
-      "suppress_range_min_in_high_stage": false,
-      "use_covariates_for_correction": true,
-      "notes": "High max-rate and spike-k because real storm pulses reach 600+ FNU."
-    },
-    "stage": {
-      "units": "ft",
-      "range_min": 0.5,
-      "range_max": 8.0,
-      "spike_threshold": 4.5,
-      "persistence_window": 12,
-      "max_rate_change": 0.7,
-      "suppress_spike_in_rain": false,
-      "suppress_rate_in_rain": false,
-      "suppress_range_min_in_high_stage": false,
-      "use_covariates_for_correction": false
+"""
+Station preset loader.
+======================
+Discovers preset JSON files in a folder and converts them into the
+ParameterConfig objects the QC engine uses. Also provides column-name
+auto-mapping based on each preset's `column_aliases`.
+"""
+
+from __future__ import annotations
+
+import json
+from dataclasses import asdict
+from pathlib import Path
+from typing import Optional
+
+from water_quality_qc_v2 import ParameterConfig
+
+
+def list_presets(folder: str | Path = "presets") -> list[dict]:
+    """Scan the preset folder and return summaries of every valid preset.
+
+    Each summary: {file, station_id, station_name, description, n_parameters}
+    Files starting with '_' are sorted last (so generic templates appear
+    after station-specific presets).
+    """
+    folder = Path(folder)
+    if not folder.exists():
+        return []
+
+    out = []
+    for f in sorted(folder.glob("*.json")):
+        try:
+            data = json.loads(f.read_text())
+            out.append({
+                "file": str(f),
+                "filename": f.name,
+                "station_id": data.get("station_id", f.stem),
+                "station_name": data.get("station_name", f.stem),
+                "description": data.get("description", ""),
+                "n_parameters": len(data.get("parameters", {})),
+                "_data": data,
+            })
+        except Exception as e:
+            out.append({
+                "file": str(f),
+                "filename": f.name,
+                "station_id": f.stem,
+                "station_name": f"⚠️ {f.name} (invalid: {e})",
+                "description": "",
+                "n_parameters": 0,
+                "_data": None,
+            })
+
+    # Stable sort: templates (prefix '_') to the bottom
+    out.sort(key=lambda p: (p["filename"].startswith("_"), p["filename"].lower()))
+    return out
+
+
+def load_preset(path: str | Path) -> dict:
+    """Load and return a single preset's raw JSON dict."""
+    return json.loads(Path(path).read_text())
+
+
+def configs_from_preset(preset: dict) -> dict[str, ParameterConfig]:
+    """Convert a preset's parameter dict to a {name: ParameterConfig} map."""
+    out = {}
+    for name, settings in preset.get("parameters", {}).items():
+        # Whitelist keys that map to ParameterConfig fields; ignore extras
+        valid_keys = set(ParameterConfig.__dataclass_fields__.keys())
+        clean_settings = {
+            "name": name,
+            **{k: v for k, v in settings.items() if k in valid_keys},
+        }
+        out[name] = ParameterConfig(**clean_settings)
+    return out
+
+
+def auto_map_columns(
+    df_columns: list[str],
+    preset: dict,
+) -> dict[str, Optional[str]]:
+    """Given a dataframe's column list and a preset, suggest column mappings.
+
+    Returns a dict like:
+        {
+          "timestamp": "Timestamp (UTC-05:00)",
+          "pH": "pH",
+          "temperature": "Water Temp",
+          "rainfall": "Precip",   # or None if no match
+          ...
+        }
+
+    Case-insensitive, partial-match-friendly:
+      - Exact match (case-insensitive) wins.
+      - Otherwise, first preset alias that's a substring of a column name
+        (or vice versa) wins.
+    """
+    aliases = preset.get("column_aliases", {})
+    cols_lower = {c.lower(): c for c in df_columns}
+
+    mapping: dict[str, Optional[str]] = {}
+    for canonical, alias_list in aliases.items():
+        match = None
+        # Pass 1: exact case-insensitive
+        for alias in alias_list:
+            if alias.lower() in cols_lower:
+                match = cols_lower[alias.lower()]
+                break
+        # Pass 2: substring
+        if match is None:
+            for alias in alias_list:
+                al = alias.lower()
+                for c_lower, c_orig in cols_lower.items():
+                    if al in c_lower or c_lower in al:
+                        match = c_orig
+                        break
+                if match:
+                    break
+        mapping[canonical] = match
+
+    return mapping
+
+
+def preset_to_session_state(preset: dict) -> dict:
+    """Build a dict of UI-state defaults from a preset.
+
+    Used by the Streamlit app to pre-fill widgets when a preset is selected.
+    """
+    cov = preset.get("covariates", {})
+    return {
+        "preset_id": preset.get("station_id"),
+        "configs": configs_from_preset(preset),
+        "rain_window_hr": float(cov.get("rain_window_hr", 1.0)),
+        "rain_event_threshold": float(cov.get("rain_event_threshold", 0.05)),
+        "stage_high_quantile": float(cov.get("stage_high_quantile", 0.90)),
+        "rainfall_col_hint": cov.get("rainfall_col_hint"),
+        "stage_col_hint": cov.get("stage_col_hint"),
     }
-  },
-  "source": "Derived from KIN_A_RAW_TEST.csv + KINA_Test_Time_Series_Data corrected dataset",
-  "version": "1.0",
-  "last_updated": "2026-05-14"
-}
